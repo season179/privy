@@ -64,7 +64,7 @@ internal final class RealtimeAudioRing: @unchecked Sendable {
         sampleRate: Double,
         channelCount: Int,
         minimumDurationSeconds: Double = 8,
-        maximumCallbackFrames: Int = 4_096,
+        maximumCallbackFrames: Int = 16_384,
         slotCount explicitSlotCount: Int? = nil
     ) {
         precondition(sampleRate > 0 && sampleRate.isFinite)
@@ -172,7 +172,6 @@ internal final class RealtimeAudioRing: @unchecked Sendable {
         precondition(Int(destination.format.channelCount) == channelCount)
         precondition(!destination.format.isInterleaved)
         precondition(destination.format.commonFormat == .pcmFormatFloat32)
-        precondition(Int(destination.frameCapacity) >= maximumCallbackFrames)
 
         let read = readIndex.load(ordering: .relaxed)
         let write = writeIndex.load(ordering: .acquiring)
@@ -180,6 +179,7 @@ internal final class RealtimeAudioRing: @unchecked Sendable {
 
         let slot = Int(read % UInt64(slotCount))
         let item = metadata[slot]
+        precondition(Int(destination.frameCapacity) >= item.frameCount)
         destination.frameLength = AVAudioFrameCount(item.frameCount)
         guard let channels = destination.floatChannelData else {
             preconditionFailure("Float32 noninterleaved destination has no channel data")
