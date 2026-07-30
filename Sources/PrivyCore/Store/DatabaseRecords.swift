@@ -308,4 +308,15 @@ enum PrivyStoreError: Error, Equatable {
     case unknownChunk(id: Int64)
     /// A relative audio path escapes `StorageLayout.audioDirectory`.
     case unsafeRelativePath(String)
+    /// A guarded `WHERE state = expected` UPDATE changed zero rows and the row is not in the
+    /// intended terminal state — the caller and the row disagree (concurrent transition,
+    /// stale id, or a misuse). Surfaced rather than silently treated as success.
+    case stateConflict(id: Int64, expected: String, actual: String)
+    /// A file measurement (stat/checksum/probe/enumeration) could not be completed; the
+    /// affected file is preserved and its row transitioned to `failed`.
+    case measurementFailed(String)
+    /// One or more reconciliation actions failed AND their required health/terminalization
+    /// write could not be durably persisted (the database was unavailable). Re-running
+    /// reconcile after the database is restored re-attempts every action.
+    case unsurfacedReconciliationFailures([String])
 }
