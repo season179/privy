@@ -54,6 +54,8 @@ private func microSnap(_ date: Date) -> Date {
     PrivyDateCoding.date(from: PrivyDateCoding.string(from: date))!
 }
 
+private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespacesAndNewlines) }
+
 // MARK: - Schema + lifecycle
 
 @Suite struct StoreTests {
@@ -315,5 +317,220 @@ private func microSnap(_ date: Date) -> Date {
         // Most-recent-first ordering.
         #expect(summary.recentHealth.first?.detail.message == "ev4")
         #expect(summary.recentHealth.last?.detail.message == "ev2")
+    }
+}
+
+// MARK: - Guarded-update changes-count (finding 1)
+
+@Suite struct StoreGuardTests {
+
+    private func newChunk(path: String) -> NewChunk {
+        NewChunk(kind: .shadow, startedAtUTC: Date(), startedMono: 0, relativeAudioPath: path)
+    }
+
+    private func state(_ dbPath: String, id: Int64) throws -> String {
+        trimmed(try sqlite(dbPath, "SELECT state FROM chunks WHERE id=\(id);"))
+    }
+    private func sizeBytes(_ dbPath: String, id: Int64) throws -> Int64 {
+        Int64(trimmed(try sqlite(dbPath, "SELECT size_bytes FROM chunks WHERE id=\(id);"))) ?? -1
+    }
+
+    @Test func zeroRowFinalizeAndCheckpointAreIdempotentForReadyRows() async throws {
+        let (store, dbPath, root) = try await makeTempStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let chunk = try await store.createChunk(newChunk(path: "a.ogg"))
+        _ = try await store.finalizeChunk(id: chunk.id, durationSeconds: 1, sizeBytes: 100, checksumSHA256: "h1")
+        // Second finalize on a ready row is idempotent (no throw) and does NOT regress metadata.
+        let again = try await store.finalizeChunk(id: chunk.id, durationSeconds: 9, sizeBytes: 999, checksumSHA256: "h9")
+        #expect(again.state == .ready)
+        #expect(again.sizeBytes == 100)
+        #expect(again.checksumSHA256 == "h1")
+        // A stale checkpoint against a ready row is a benign no-op (no throw, no change).
+        try await store.checkpointChunk(id: chunk.id, durationSeconds: 9, sizeBytes: 999)
+        #expect(try sizeBytes(dbPath, id: chunk.id) == 100)
+        #expect(try state(dbPath, id: chunk.id) == "ready")
+    }
+
+    @Test func zeroRowTransitionsIntoUnexpectedStateThrowStateConflict() async throws {
+        let (store, dbPath, root) = try await makeTempStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let ready = try await store.createChunk(newChunk(path: "a.ogg"))
+        _ = try await store.finalizeChunk(id: ready.id, durationSeconds: 1, sizeBytes: 1, checksumSHA256: "h")
+        // Failing a `ready` row is a conflict (only `recording` may be failed).
+        await #expect(throws: PrivyStoreError.self) {
+            try await store.failChunk(id: ready.id, reason: "should not work")
+        }
+        #expect(try state(dbPath, id: ready.id) == "ready")
+
+        let failed = try await store.createChunk(newChunk(path: "b.ogg"))
+        try await store.failChunk(id: failed.id, reason: "boom")
+        // Checkpointing/finalizing a `failed` row is a conflict; failing again is idempotent.
+        await #expect(throws: PrivyStoreError.self) {
+            try await store.checkpointChunk(id: failed.id, durationSeconds: 1, sizeBytes: 1)
+        }
+        await #expect(throws: PrivyStoreError.self) {
+            _ = try await store.finalizeChunk(id: failed.id, durationSeconds: 1, sizeBytes: 1, checksumSHA256: "h")
+        }
+        try await store.failChunk(id: failed.id, reason: "again")  // idempotent, no throw
+        #expect(try state(dbPath, id: failed.id) == "failed")
+    }
+
+    @Test func unknownIdTransitionsAreNotMisclassifiedAsConflicts() async throws {
+        let (store, _, root) = try await makeTempStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        // A truly absent id surfaces as unknownChunk, not as a benign idempotent result.
+        await #expect(throws: PrivyStoreError.self) {
+            try await store.checkpointChunk(id: 424242, durationSeconds: 1, sizeBytes: 1)
+        }
+        await #expect(throws: PrivyStoreError.self) {
+            _ = try await store.finalizeChunk(id: 424242, durationSeconds: 1, sizeBytes: 1, checksumSHA256: "h")
+        }
+        await #expect(throws: PrivyStoreError.self) {
+            try await store.failChunk(id: 424242, reason: "x")
+        }
+    }
+}
+
+// MARK: - Audio probe seam, locator, bounded process (findings 6 + 8)
+
+@Suite struct AudioProbeTests {
+
+    @Test func locateFFProbeHonorsEnvStrictlyWithoutFallthrough() throws {
+        // An invalid PRIVY_FFPROBE_PATH yields unavailable with NO fallthrough to common paths.
+        #expect(locateFFProbe(env: ["PRIVY_FFPROBE_PATH": "/definitely/not/here/ffprobe"]) == nil)
+        #expect(locateFFProbe(env: ["PRIVY_FFPROBE_PATH": ""]) == locateFFProbe(env: [:]))
+        // A valid configured path is used verbatim.
+        let probe = locateFFProbe(env: [:])
+        if let real = probe {
+            #expect(locateFFProbe(env: ["PRIVY_FFPROBE_PATH": real]) == real)
+        }
+    }
+
+    @Test func unavailableExecutableIsReportedAsUnavailable() async throws {
+        let probe = FFprobeAudioProbe(ffprobePath: nil, timeout: .seconds(1))
+        let result = await probe.probe(durationOf: URL(fileURLWithPath: "/tmp/whatever"))
+        if case .failed(let reason) = result {
+            #expect(reason.contains("unavailable"))
+        } else {
+            Issue.record("expected .failed, got \(result)")
+        }
+    }
+
+    @Test func launchFailureIsReportedAsFailed() async throws {
+        // `/dev/null` is not executable, so Process.run throws.
+        let probe = FFprobeAudioProbe(ffprobePath: "/dev/null", timeout: .seconds(2))
+        let result = await probe.probe(durationOf: URL(fileURLWithPath: "/tmp/whatever"))
+        if case .failed(let reason) = result {
+            #expect(reason.contains("launch"))
+        } else {
+            Issue.record("expected .failed launch, got \(result)")
+        }
+    }
+
+    @Test func nonzeroExitIsReportedAsFailed() async throws {
+        let probe = FFprobeAudioProbe(ffprobePath: "/usr/bin/false", timeout: .seconds(2))
+        let result = await probe.probe(durationOf: URL(fileURLWithPath: "/tmp/whatever"))
+        if case .failed(let reason) = result {
+            #expect(reason.contains("status"))
+        } else {
+            Issue.record("expected .failed nonzero, got \(result)")
+        }
+    }
+
+    @Test func malformedDurationIsReportedAsFailed() async throws {
+        // `/bin/echo` prints its arguments, not a number.
+        let probe = FFprobeAudioProbe(ffprobePath: "/bin/echo", timeout: .seconds(2))
+        let result = await probe.probe(durationOf: URL(fileURLWithPath: "/tmp/whatever"))
+        if case .failed(let reason) = result {
+            #expect(reason.contains("parseable"))
+        } else {
+            Issue.record("expected .failed malformed, got \(result)")
+        }
+    }
+
+    @Test func hungExecutableIsTerminatedAndReapedWithinBound() async throws {
+        // A genuinely hanging executable is killed at the timeout and reaped; total wait is
+        // bounded by the timeout, not the child's natural lifetime.
+        let sleeper = try makeSleeperScript(seconds: 30)
+        defer { try? FileManager.default.removeItem(at: sleeper) }
+        let probe = FFprobeAudioProbe(ffprobePath: sleeper.path, timeout: .milliseconds(300))
+        let start = Date()
+        let result = await probe.probe(durationOf: URL(fileURLWithPath: "/tmp/whatever"))
+        let elapsed = Date().timeIntervalSince(start)
+        if case .failed(let reason) = result {
+            #expect(reason.contains("timed out"))
+        } else {
+            Issue.record("expected .failed timeout, got \(result)")
+        }
+        #expect(elapsed < 3.0, "probe must be bounded by the timeout (~0.3s), took \(elapsed)s")
+        // Child must be reaped — no sleeper lingering.
+        #expect(lingerCount("sleep 30") == 0)
+    }
+
+    @Test func boundedProcessTerminatesAndReapsHungChildDirectly() async throws {
+        let start = Date()
+        let outcome = await BoundedProcess.run(
+            executable: "/bin/sleep", arguments: ["30"], timeout: .milliseconds(250)
+        )
+        let elapsed = Date().timeIntervalSince(start)
+        if case .failure(let error) = outcome {
+            #expect(error == .timedOut)
+        } else {
+            Issue.record("expected .timedOut, got \(outcome)")
+        }
+        #expect(elapsed < 2.0)
+        #expect(lingerCount("sleep 30") == 0)
+    }
+
+    @Test(.enabled(if: locateFFProbe(env: ProcessInfo.processInfo.environment) != nil))
+    func realFFprobeDecodesADurationWhenAvailable() async throws {
+        // Build a real 1s Ogg and confirm the real probe decodes it.
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("privy-probe-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let file = dir.appendingPathComponent("x.ogg")
+        try runFFmpegSilence(at: file, seconds: 1.0)
+        let probe = FFprobeAudioProbe()
+        let result = await probe.probe(durationOf: file)
+        guard case .decodable(let duration) = result else {
+            Issue.record("expected .decodable, got \(result)"); return
+        }
+        #expect(abs(duration - 1.0) < 0.2)
+    }
+}
+
+private func makeSleeperScript(seconds: Int) throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("privy-sleeper-\(UUID().uuidString).sh")
+    try "#!/bin/sh\nsleep \(seconds)\n".write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url
+}
+
+private func lingerCount(_ pattern: String) -> Int {
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+    process.arguments = ["-f", pattern]
+    let pipe = Pipe()
+    process.standardOutput = pipe
+    process.standardError = Pipe()
+    do { try process.run() } catch { return 0 }
+    process.waitUntilExit()
+    let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+    return out.split(separator: "\n").filter { !$0.isEmpty }.count
+}
+
+private func runFFmpegSilence(at url: URL, seconds: Double) throws {
+    let bin = ProcessInfo.processInfo.environment["PRIVY_FFMPEG_PATH"] ?? "/opt/homebrew/bin/ffmpeg"
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: bin)
+    process.arguments = ["-nostats", "-loglevel", "error", "-y",
+                         "-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=16000",
+                         "-t", String(seconds), "-c:a", "libopus", "-f", "ogg", url.path]
+    process.standardOutput = Pipe()
+    process.standardError = Pipe()
+    try process.run()
+    process.waitUntilExit()
+    guard process.terminationStatus == 0 else {
+        throw NSError(domain: "AudioProbeTests", code: 1, userInfo: [NSLocalizedDescriptionKey: "ffmpeg failed"])
     }
 }
