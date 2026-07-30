@@ -1,3 +1,4 @@
+import AVFoundation
 import Foundation
 import PrivyCore
 
@@ -8,6 +9,11 @@ actor AppCoordinator {
     }
 
     private struct StartupInterrupted: Error {}
+    private struct MicrophoneDenied: LocalizedError {
+        var errorDescription: String? {
+            "Microphone access is denied. Enable Privy in System Settings → Privacy & Security → Microphone"
+        }
+    }
 
     private let model: AppModel
     private var lifecycle: Lifecycle = .idle
@@ -52,6 +58,11 @@ actor AppCoordinator {
             try await store.prepareDatabase()
             try requireStartup()
             _ = try await store.reconcile(storage: layout, at: clock.now())
+            try requireStartup()
+
+            guard await AVCaptureDevice.requestAccess(for: .audio) else {
+                throw MicrophoneDenied()
+            }
             try requireStartup()
 
             let controller = PrivyRuntimeFactory.makeShadowCaptureController(
