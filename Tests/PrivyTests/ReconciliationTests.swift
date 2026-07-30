@@ -405,6 +405,101 @@ private func files(in dir: URL) -> [String] {
         #expect(FileManager.default.fileExists(atPath: audioURL(layout, aPath + ".partial").path))
     }
 
+    @Test func reconcileFinalizeWithVanishedRowSurfacesMissingNotReady() async throws {
+        // Finding 1: a guarded finalize UPDATE must classify its zero-row result. An external
+        // DELETE between inventory and apply makes the UPDATE affect zero rows; classify reads
+        // it as `.missing`, throws `unknownChunk`, and the reconcile loop durably surfaces the
+        // failure — it never logs the vanished row as a silent ready.
+        let (layout, _, root) = try await makeLayoutAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = layout.databaseURL.path
+        let gate = ProbeStartGate()
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL,
+            audioProbe: GatedSlowProbe(perProbeSeconds: 0.3, gate: gate, result: .decodable(durationSeconds: 0.5)),
+            writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+        let relPath = "2026-01-01T00-00-00.000000Z_vanished.ogg"
+        let chunk = try await store.createChunk(newChunk(path: relPath))
+        try writeValidOgg(at: audioURL(layout, relPath + ".partial"), durationSeconds: 1.0)
+
+        // The gate fires once the inventory row-read is done and the probe begins yielding;
+        // awaiting it guarantees the DELETE lands after the read but before the guarded apply
+        // UPDATE, independent of host scheduling/load.
+        async let reportFuture = store.reconcile(storage: layout, at: reading())
+        await gate.wait()
+        _ = try sqlite(db, "DELETE FROM chunks WHERE id=\(chunk.id);")
+        _ = try await reportFuture
+
+        #expect(try countRows(db, whereClause: "id=\(chunk.id)") == 0, "vanished row must stay gone")
+        #expect(try countRows(db, whereClause: "state='ready'") == 0, "a vanished row must never become ready")
+        #expect(try healthKinds(db).contains("error"), "the missing-row failure must be surfaced, not swallowed")
+    }
+
+    @Test func reconcileFinalizeWithExternallyMutatedRowSurfacesConflictNotReady() async throws {
+        // Finding 1: a guarded finalize UPDATE that hits zero rows because the row moved to an
+        // unexpected/future state must classify as `.conflict` and throw — never become a
+        // silent ready. Here an external transition to `transcribed` (a later-milestone state)
+        // lands between inventory and apply.
+        let (layout, _, root) = try await makeLayoutAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = layout.databaseURL.path
+        let gate = ProbeStartGate()
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL,
+            audioProbe: GatedSlowProbe(perProbeSeconds: 0.3, gate: gate, result: .decodable(durationSeconds: 0.5)),
+            writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+        let relPath = "2026-01-01T00-00-00.000000Z_conflict.ogg"
+        let chunk = try await store.createChunk(newChunk(path: relPath))
+        try writeValidOgg(at: audioURL(layout, relPath + ".partial"), durationSeconds: 1.0)
+
+        async let reportFuture = store.reconcile(storage: layout, at: reading())
+        await gate.wait()
+        _ = try sqlite(db, "UPDATE chunks SET state='transcribed' WHERE id=\(chunk.id);")
+        _ = try await reportFuture
+
+        let state = try trimmed(sqlite(db, "SELECT state FROM chunks WHERE id=\(chunk.id);"))
+        #expect(state == "transcribed", "an externally-mutated row must not be overwritten back to ready")
+        #expect(try countRows(db, whereClause: "state='ready'") == 0)
+        #expect(try healthKinds(db).contains("error"), "the state conflict must be surfaced")
+    }
+
+    @Test func reconcilePreservedRowAlreadyFailedIsIdempotentClassified() async throws {
+        // Finding 1: `markFailedAndLog` must read changesCount. A row pre-terminalized to
+        // `failed` between inventory and apply makes the terminalize UPDATE hit zero rows;
+        // classify reads it as `.alreadyTerminal` (idempotent) and still logs the event rather
+        // than silently no-op-ing without inspecting the row.
+        let (layout, _, root) = try await makeLayoutAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = layout.databaseURL.path
+        let gate = ProbeStartGate()
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL,
+            audioProbe: GatedSlowProbe(perProbeSeconds: 0.3, gate: gate, result: .failed(reason: "simulated undecodable")),
+            writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+        let relPath = "2026-01-01T00-00-00.000000Z_prefailed.ogg"
+        let chunk = try await store.createChunk(newChunk(path: relPath))
+        try writeGarbage(at: audioURL(layout, relPath + ".partial"))
+
+        async let reportFuture = store.reconcile(storage: layout, at: reading())
+        await gate.wait()
+        _ = try sqlite(db, "UPDATE chunks SET state='failed' WHERE id=\(chunk.id);")
+        _ = try await reportFuture
+
+        let state = try trimmed(sqlite(db, "SELECT state FROM chunks WHERE id=\(chunk.id);"))
+        #expect(state == "failed", "pre-failed row stays failed (idempotent terminalization)")
+        #expect(try countRows(db, whereClause: "state='recording'") == 0)
+        #expect(try healthKinds(db).contains("recovery"), "the preserved-unreadable event is still logged")
+    }
+
     @Test func reconcileThrowsAggregateWhenDatabaseUnavailableMidPass() async throws {
         // "DB-failure midway": the database becomes unavailable mid-pass. The required
         // failure-surfacing write also fails, so reconcile must throw an aggregate rather
@@ -700,5 +795,53 @@ private struct SlowProbe: AudioProbing {
         let nanos = UInt64(perProbeSeconds * 1_000_000_000)
         try? await Task.sleep(nanoseconds: nanos)
         return .decodable(durationSeconds: 0.5)
+    }
+}
+
+/// A one-shot gate a test awaits before mutating the DB, so the mutation is guaranteed to
+/// land AFTER the inventory row-read but BEFORE the guarded apply UPDATE (during the
+/// probe's actor yield). `@unchecked Sendable` is justified: all access is serialized via
+/// `lock`.
+private final class ProbeStartGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+    private var fired = false
+
+    func wait() async {
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            lock.lock()
+            if fired {
+                lock.unlock(); c.resume()
+            } else {
+                continuation = c; lock.unlock()
+            }
+        }
+    }
+
+    /// Called from the probe the instant it starts — by then the inventory row-read has
+    /// completed (buildInventory reads rows before it probes any file).
+    func fire() {
+        lock.lock()
+        let c = continuation
+        continuation = nil
+        fired = true
+        lock.unlock()
+        c?.resume()
+    }
+}
+
+/// A slow probe that fires a `ProbeStartGate` when it starts (signaling the inventory read
+/// is done), then yields for `perProbeSeconds` before returning `result`. Used to drive the
+/// reconcile zero-row paths deterministically: the test awaits the gate, mutates the DB, and
+/// the mutation reliably lands during the yield — independent of host scheduling/load.
+private struct GatedSlowProbe: AudioProbing {
+    let perProbeSeconds: Double
+    let gate: ProbeStartGate
+    let result: AudioProbeResult
+    func probe(durationOf url: URL) async -> AudioProbeResult {
+        gate.fire()
+        let nanos = UInt64(perProbeSeconds * 1_000_000_000)
+        try? await Task.sleep(nanoseconds: nanos)
+        return result
     }
 }
