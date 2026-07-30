@@ -599,11 +599,21 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             let baselineEnd = inFlightStreamEnd ?? lastStreamEnd
             if let baselineEpoch, let baselineEnd {
                 let normalizedDrop = max(0, Int64((duration * Double(privySampleRate)).rounded()))
-                accountedOverrun = AccountedOverrun(
-                    captureEpoch: baselineEpoch,
-                    streamEndBeforeDrop: baselineEnd,
-                    expectedResumedStreamStart: baselineEnd + normalizedDrop
-                )
+                if let existing = accountedOverrun,
+                   existing.captureEpoch == baselineEpoch,
+                   existing.streamEndBeforeDrop == baselineEnd {
+                    accountedOverrun = AccountedOverrun(
+                        captureEpoch: existing.captureEpoch,
+                        streamEndBeforeDrop: existing.streamEndBeforeDrop,
+                        expectedResumedStreamStart: existing.expectedResumedStreamStart + normalizedDrop
+                    )
+                } else {
+                    accountedOverrun = AccountedOverrun(
+                        captureEpoch: baselineEpoch,
+                        streamEndBeforeDrop: baselineEnd,
+                        expectedResumedStreamStart: baselineEnd + normalizedDrop
+                    )
+                }
             } else {
                 accountedOverrun = nil
             }
@@ -894,8 +904,30 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         gapStarted: ClockReading? = nil,
         gapMessage: String? = nil
     ) async {
-        guard !terminalFailureInProgress else { return }
+        if terminalFailureInProgress {
+            // Duplicate fatal callbacks emitted by the stop path observe `.error` and
+            // are ignored. A recovery attempt that has moved back to `.recovering`
+            // must still fail visibly instead of being swallowed by this re-entry guard.
+            guard case .recovering = captureReality else { return }
+            lifecycleGeneration &+= 1
+            intentionalStopReason = .fatalError
+            watchdog.disarm()
+            captureReality = .error(message)
+            publishSnapshot()
+            // The first episode already terminally resolved its writer; this branch
+            // handles failure before recovery has accepted fresh audio into a new chunk.
+            await capture.stop(reason: .fatalError)
+            engineRunning = false
+            if let writerFailure {
+                await reportWriterError(writerFailure, at: at)
+            }
+            await persistHealth(kind: .error, severity: .error, at: at, message: message)
+            publishSnapshot()
+            return
+        }
+        if case .error = captureReality { return }
         terminalFailureInProgress = true
+        defer { terminalFailureInProgress = false }
         lifecycleGeneration &+= 1
         intentionalStopReason = .fatalError
         watchdog.disarm()
