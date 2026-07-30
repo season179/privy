@@ -125,59 +125,57 @@ enum BoundedProcess {
             return .failure(.launchFailed(error.localizedDescription))
         }
 
+        // Exactly one of {natural exit, timeout} atomically claims the single outcome slot
+        // and is solely responsible for classifying + resuming. There is no separate flag
+        // a natural exit can be suppressed by, so a successful probe cannot be misclassified
+        // as a timeout (finding 3).
         let state = ProbeState()
         return await withCheckedContinuation { (continuation: CheckedContinuation<Outcome, Never>) in
-            // Natural exit: classify by status, UNLESS the timeout task already flagged a
-            // timeout (in which case it owns the resume with `.timedOut`).
             process.terminationHandler = { proc in
-                if state.isTimedOut { return }  // timeout task resumes
-                guard state.tryResume() else { return }
                 let data = stdout.fileHandleForReading.readDataToEndOfFile()
+                guard state.claim() else { return }  // timeout task owns the outcome
                 if proc.terminationStatus == 0 {
                     continuation.resume(returning: .success(data))
                 } else {
                     continuation.resume(returning: .failure(.nonzeroExit(proc.terminationStatus)))
                 }
             }
-            // Detached timeout: mark timed-out BEFORE terminating so the natural-exit
-            // handler defers; then terminate, reap, and resume `.timedOut` if not already.
+            // Detached timeout: if the process already exited naturally by the deadline, defer
+            // to its terminationHandler (it owns the outcome). Otherwise atomically claim,
+            // then escalate SIGTERM -> SIGINT -> SIGKILL (a signal a child cannot trap),
+            // reaping deterministically. SIGKILL guarantees prompt death, so the final
+            // waitUntilExit is bounded. The natural handler contests the same one-shot claim
+            // (it does not read a separate flag), so it can never be suppressed.
             Task.detached(priority: .userInitiated) {
                 let nanos = UInt64(max(0, timeout.components.seconds)) * 1_000_000_000
                     + UInt64(max(0, timeout.components.attoseconds / 1_000_000_000))
                 try? await Task.sleep(nanoseconds: nanos)
-                guard process.isRunning else { return }
-                state.markTimedOut()
-                process.terminate()
-                try? await Task.sleep(nanoseconds: 200_000_000)  // give SIGTERM a moment
-                if process.isRunning { process.interrupt() }
-                process.waitUntilExit()  // reap deterministically; no zombie/linger
-                if state.tryResume() {
-                    continuation.resume(returning: .failure(.timedOut))
+                guard process.isRunning else { return }              // finished in time
+                guard state.claim() else { return }                 // natural exit won the claim
+                if process.isRunning { process.terminate() }        // SIGTERM
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if process.isRunning { process.interrupt() }        // SIGINT
+                try? await Task.sleep(nanoseconds: 150_000_000)
+                if process.isRunning {
+                    _ = kill(process.processIdentifier, SIGKILL)   // SIGKILL: untrappable
                 }
+                process.waitUntilExit()  // reap; bounded because SIGKILL cannot be caught
+                continuation.resume(returning: .failure(.timedOut))
             }
         }
     }
 }
 
-/// State for one bounded-process run: a one-shot resume guard plus a timed-out flag. Both
-/// are lock-protected; `@unchecked Sendable` is justified because every access goes through
-/// `lock`.
+/// A one-shot outcome claim for a bounded process run. The first caller to win `claim()`
+/// owns classification and the continuation resume; everyone else defers. All access is
+/// serialized through `lock`; `@unchecked Sendable` is justified by that lock.
 private final class ProbeState: @unchecked Sendable {
     private let lock = NSLock()
-    private var resumed = false
-    private var timedOut = false
-    func tryResume() -> Bool {
+    private var claimed = false
+    func claim() -> Bool {
         lock.lock(); defer { lock.unlock() }
-        if resumed { return false }
-        resumed = true
+        if claimed { return false }
+        claimed = true
         return true
-    }
-    func markTimedOut() {
-        lock.lock(); defer { lock.unlock() }
-        timedOut = true
-    }
-    var isTimedOut: Bool {
-        lock.lock(); defer { lock.unlock() }
-        return timedOut
     }
 }
