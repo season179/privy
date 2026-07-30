@@ -11,6 +11,12 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         var endMonotonic: Double?
     }
 
+    private struct AccountedOverrun: Sendable {
+        let captureEpoch: UUID
+        let streamEndBeforeDrop: Int64
+        let expectedResumedStreamStart: Int64
+    }
+
     nonisolated let snapshots: AsyncStream<PipelineSnapshot>
 
     private let snapshotContinuation: AsyncStream<PipelineSnapshot>.Continuation
@@ -40,11 +46,13 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     private var lifecycleGeneration: UInt64 = 0
     private var intentionalStopReason: StopReason?
     private var terminalFailureInProgress = false
-    private var accountedOverrunAwaitingNextBlock = false
+    private var accountedOverrun: AccountedOverrun?
 
     private var lastCaptureEpoch: UUID?
     private var lastSequence: UInt64?
     private var lastStreamEnd: Int64?
+    private var inFlightCaptureEpoch: UUID?
+    private var inFlightStreamEnd: Int64?
     private var vadGeneration: UInt64 = 0
     private var chunkSpans: [ChunkSpan] = []
     private var pendingVADEvents: [VADEventRecord] = []
@@ -333,6 +341,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
 
     private func performDeviceRestart(generation: UInt64) async {
         guard generation == deviceRestartGeneration, !shuttingDown else { return }
+        // A real device change is also the recovery path from terminal input loss.
+        // The failure episode remains latched until fresh audio reaches a new chunk.
         let now = clock.now()
         let uid = pendingDeviceUID
         pendingDeviceUID = nil
@@ -407,15 +417,19 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         }
 
         let generation = lifecycleGeneration
-        let discontinuity = continuityGap(before: block)
-        let suppressAccountedOverrun = accountedOverrunAwaitingNextBlock
-        accountedOverrunAwaitingNextBlock = false
+        let discontinuity = reconciledContinuityGap(
+            continuityGap(before: block),
+            before: block
+        )
+        inFlightCaptureEpoch = block.captureEpoch
+        inFlightStreamEnd = block.streamSampleStart + Int64(block.samples.count)
         let transitions: [WriterTransition]
         do {
             // Lossless-priority lane: this always completes before the VAD copy is
             // offered to its bounded, best-effort lane.
             transitions = try await writer.append(block)
         } catch {
+            clearInFlightBlock()
             if generation != lifecycleGeneration || shuttingDown {
                 await reportWriterError(error, at: block.firstSampleTime)
                 await closeWriterAfterStaleAppend(at: block.firstSampleTime)
@@ -431,12 +445,14 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         }
 
         guard generation == lifecycleGeneration, !shuttingDown else {
+            clearInFlightBlock()
             apply(transitions)
             await closeWriterAfterStaleAppend(at: block.firstSampleTime)
             return
         }
         switch captureReality {
         case .paused, .stopped, .error:
+            clearInFlightBlock()
             apply(transitions)
             await closeWriterAfterStaleAppend(at: block.firstSampleTime)
             return
@@ -444,7 +460,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             apply(transitions)
         }
 
-        if let discontinuity, !suppressAccountedOverrun {
+        if let discontinuity {
             vadGeneration &+= 1
             await persistHealth(
                 kind: .gap,
@@ -467,6 +483,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         lastCaptureEpoch = block.captureEpoch
         lastSequence = block.sequence
         lastStreamEnd = block.streamSampleStart + Int64(block.samples.count)
+        clearInFlightBlock()
         engineRunning = true
         currentChunk = await writer.activeChunk()
 
@@ -496,6 +513,9 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             }
             if captureReality != .recording {
                 captureReality = .recording
+                // A fresh heartbeat reaching an open writer proves recovery completed;
+                // allow controls and future terminal episodes to run normally again.
+                terminalFailureInProgress = false
                 await persistHealth(
                     kind: .recordingStarted,
                     severity: .info,
@@ -575,7 +595,18 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
 
         case .queueOverrun(let at, let droppedFrames, let duration):
             vadGeneration &+= 1
-            accountedOverrunAwaitingNextBlock = true
+            let baselineEpoch = inFlightCaptureEpoch ?? lastCaptureEpoch
+            let baselineEnd = inFlightStreamEnd ?? lastStreamEnd
+            if let baselineEpoch, let baselineEnd {
+                let normalizedDrop = max(0, Int64((duration * Double(privySampleRate)).rounded()))
+                accountedOverrun = AccountedOverrun(
+                    captureEpoch: baselineEpoch,
+                    streamEndBeforeDrop: baselineEnd,
+                    expectedResumedStreamStart: baselineEnd + normalizedDrop
+                )
+            } else {
+                accountedOverrun = nil
+            }
             captureReality = .recovering("capture queue overrun")
             await persistHealth(
                 kind: .queueOverrun,
@@ -631,6 +662,29 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             message: "source timeline discontinuity before sequence \(block.sequence)",
             duration: missing > 0 ? Double(missing) / Double(privySampleRate) : nil,
             droppedFrames: missing > 0 ? missing : nil
+        )
+    }
+
+    private func reconciledContinuityGap(
+        _ measured: ContinuityGap?,
+        before block: AudioBlock16k
+    ) -> ContinuityGap? {
+        guard let accountedOverrun else { return measured }
+        self.accountedOverrun = nil
+        guard accountedOverrun.captureEpoch == block.captureEpoch,
+              block.streamSampleStart >= accountedOverrun.streamEndBeforeDrop else {
+            return measured
+        }
+
+        let unaccountedSamples = max(
+            0,
+            block.streamSampleStart - accountedOverrun.expectedResumedStreamStart
+        )
+        guard unaccountedSamples > 0 else { return nil }
+        return ContinuityGap(
+            message: "unaccounted source timeline discontinuity after queue overrun before sequence \(block.sequence)",
+            duration: Double(unaccountedSamples) / Double(privySampleRate),
+            droppedFrames: unaccountedSamples
         )
     }
 
@@ -1089,11 +1143,17 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         )
     }
 
+    private func clearInFlightBlock() {
+        inFlightCaptureEpoch = nil
+        inFlightStreamEnd = nil
+    }
+
     private func resetCaptureContinuity() {
         lastCaptureEpoch = nil
         lastSequence = nil
         lastStreamEnd = nil
-        accountedOverrunAwaitingNextBlock = false
+        clearInFlightBlock()
+        accountedOverrun = nil
         vadGeneration &+= 1
     }
 
