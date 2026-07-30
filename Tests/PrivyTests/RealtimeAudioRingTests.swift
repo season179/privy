@@ -152,6 +152,30 @@ private func makeDestination(
         #expect(afterGap.sourceFrameStart == 9)
     }
 
+    @Test func callbackLargerThanTapHintIsCapturedWhole() {
+        let frames = 8_192
+        let ring = RealtimeAudioRing(
+            sampleRate: 48_000,
+            channelCount: 1
+        )
+        let source = makePCMBuffer(frames: frames, base: 0.5)
+        guard case .accepted(let metadata) = ring.push(
+            buffer: source,
+            time: makeTime()
+        ) else {
+            Issue.record("an 8192-frame device callback must not be rejected")
+            return
+        }
+        #expect(metadata.frameCount == frames)
+
+        let destination = makeDestination(capacity: frames)
+        #expect(ring.pop(into: destination) == metadata)
+        #expect(destination.frameLength == AVAudioFrameCount(frames))
+        #expect(destination.floatChannelData![0][0] == 0.5)
+        #expect(destination.floatChannelData![0][frames - 1] == 0.5 + Float(frames - 1))
+        #expect(ring.takeDroppedSourceFrames() == 0)
+    }
+
     @Test func defaultCapacityPreallocatesAtLeastEightSeconds() {
         let ring = RealtimeAudioRing(
             sampleRate: 44_100,
