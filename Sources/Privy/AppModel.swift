@@ -115,11 +115,10 @@ final class AppModel {
     }
 
     var currentChunkElapsed: String {
-        guard let snapshot, let chunk = snapshot.currentChunk else { return "—" }
-        let heartbeatElapsed = snapshot.lastAudioAtUTC.map {
-            max(0, $0.timeIntervalSince(chunk.startedAtUTC))
-        } ?? 0
-        return Self.duration(max(chunk.durationSeconds, heartbeatElapsed))
+        // Durations must stay monotonic/sample-derived; subtracting wall-clock dates
+        // within a clock epoch is forbidden, so elapsed advances in checkpoint quanta.
+        guard let chunk = snapshot?.currentChunk else { return "—" }
+        return Self.duration(chunk.durationSeconds)
     }
 
     var bytesRecordedToday: String {
