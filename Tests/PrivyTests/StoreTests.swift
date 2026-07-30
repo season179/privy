@@ -482,6 +482,32 @@ private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespa
         #expect(lingerCount("sleep 30") == 0)
     }
 
+    @Test func signalIgnoringChildIsSigkillReapedWithinBound() async throws {
+        // A child that IGNORES SIGTERM/SIGINT (a misbehaving ffprobe) must still be killed and
+        // reaped within a bounded time: BoundedProcess escalates SIGTERM -> SIGINT -> SIGKILL,
+        // and SIGKILL cannot be trapped. The fixture busy-loops as a single process (no
+        // grandchild), so SIGKILL leaves nothing lingering. This is the case the prior
+        // SIGTERM/SIGINT-only code hung forever on.
+        let script = try makeSignalIgnoringScript()
+        defer { try? FileManager.default.removeItem(at: script) }
+        let start = Date()
+        let outcome = await BoundedProcess.run(
+            executable: script.path, arguments: [], timeout: .milliseconds(300)
+        )
+        let elapsed = Date().timeIntervalSince(start)
+        if case .failure(let error) = outcome {
+            #expect(error == .timedOut)
+        } else {
+            Issue.record("expected .timedOut for a signal-ignoring child, got \(outcome)")
+        }
+        // timeout(0.3s) + SIGTERM/SIGINT/SIGKILL grace(~0.3s) ≈ 0.6s — far below the child's
+        // natural (infinite) lifetime.
+        #expect(elapsed < 2.0, "signal-ignoring child must be SIGKILL-reaped within bound, took \(elapsed)s")
+        // Let the OS finalize reaping, then confirm nothing lingers.
+        try await Task.sleep(nanoseconds: 200_000_000)
+        #expect(lingerCount(script.lastPathComponent) == 0, "signal-ignoring child must not linger")
+    }
+
     @Test(.enabled(if: locateFFProbe(env: ProcessInfo.processInfo.environment) != nil))
     func realFFprobeDecodesADurationWhenAvailable() async throws {
         // Build a real 1s Ogg and confirm the real probe decodes it.
@@ -502,6 +528,17 @@ private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespa
 private func makeSleeperScript(seconds: Int) throws -> URL {
     let url = FileManager.default.temporaryDirectory.appendingPathComponent("privy-sleeper-\(UUID().uuidString).sh")
     try "#!/bin/sh\nsleep \(seconds)\n".write(to: url, atomically: true, encoding: .utf8)
+    try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+    return url
+}
+
+/// A single-process shell that ignores SIGTERM and SIGINT and busy-loops forever — only
+/// SIGKILL can stop it. Used to prove BoundedProcess's SIGKILL escalation bounds a child the
+/// prior SIGTERM/SIGINT-only code hung on. Busy-loops in the shell itself (no `sleep`
+/// grandchild), so SIGKILL leaves nothing lingering.
+private func makeSignalIgnoringScript() throws -> URL {
+    let url = FileManager.default.temporaryDirectory.appendingPathComponent("privy-trap-\(UUID().uuidString).sh")
+    try "#!/bin/sh\ntrap '' TERM INT\nwhile :; do :\ndone\n".write(to: url, atomically: true, encoding: .utf8)
     try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
     return url
 }
