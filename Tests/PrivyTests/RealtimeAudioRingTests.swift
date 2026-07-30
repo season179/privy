@@ -50,7 +50,9 @@ private func makeDestination(
     )!
 }
 
-@Suite struct RealtimeAudioRingTests {
+// AVAudioPCMBuffer's allocator is process-global; serialize fixture creation so TSan
+// observes only the deliberate producer/consumer concurrency inside the stress test.
+@Suite(.serialized) struct RealtimeAudioRingTests {
     @Test func emptyFullAndWraparoundUseTheRealPushPopPath() {
         let ring = RealtimeAudioRing(
             sampleRate: 48_000,
