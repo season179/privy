@@ -20,12 +20,6 @@ public struct ClockReading: Sendable, Equatable {
     /// Changes only when the app process creates a new `SystemClock`. Readings from
     /// different epochs cannot be meaningfully subtracted.
     public let clockEpoch: UUID
-
-    public init(wallUTC: Date, monotonicSeconds: Double, clockEpoch: UUID) {
-        self.wallUTC = wallUTC
-        self.monotonicSeconds = monotonicSeconds
-        self.clockEpoch = clockEpoch
-    }
 }
 
 /// A clock that produces `ClockReading` values and computes intra-epoch durations.

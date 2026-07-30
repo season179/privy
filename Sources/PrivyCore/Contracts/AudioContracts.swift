@@ -38,20 +38,6 @@ public struct AudioBlock16k: Sendable, Equatable {
 
     /// Mono, finite Float32 samples; normally exactly 1600 samples (100 ms).
     public let samples: [Float]
-
-    public init(
-        captureEpoch: UUID,
-        sequence: UInt64,
-        streamSampleStart: Int64,
-        firstSampleTime: ClockReading,
-        samples: [Float]
-    ) {
-        self.captureEpoch = captureEpoch
-        self.sequence = sequence
-        self.streamSampleStart = streamSampleStart
-        self.firstSampleTime = firstSampleTime
-        self.samples = samples
-    }
 }
 
 /// Discrete capture lifecycle events surfaced alongside the audio stream. `queueOverrun`
@@ -73,11 +59,6 @@ public struct CaptureStreams: Sendable {
 
     /// Capture lifecycle events.
     public let events: AsyncStream<CaptureEvent>
-
-    public init(audio: AsyncStream<AudioBlock16k>, events: AsyncStream<CaptureEvent>) {
-        self.audio = audio
-        self.events = events
-    }
 }
 
 /// A continuously recording audio source. Implementations own `AVAudioEngine`.

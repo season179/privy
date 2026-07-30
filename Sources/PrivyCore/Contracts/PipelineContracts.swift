@@ -39,13 +39,6 @@ public struct VADObservation: Sendable, Equatable {
     public let probability: Float
     /// `speechStart`/`speechEnd` only; `nil` for a pure score observation.
     public let boundary: VADEventKind?
-
-    public init(streamSampleIndex: Int64, monotonicSeconds: Double, probability: Float, boundary: VADEventKind?) {
-        self.streamSampleIndex = streamSampleIndex
-        self.monotonicSeconds = monotonicSeconds
-        self.probability = probability
-        self.boundary = boundary
-    }
 }
 
 /// The VAD adapter interface. `VADService` (W4) is generic over an internal
@@ -75,22 +68,6 @@ public struct PipelineSnapshot: Sendable, Equatable {
     public let bytesRecordedToday: Int64
     public let recentHealth: [HealthEvent]
     public let lastAudioAtUTC: Date?
-
-    public init(
-        capture: CaptureReality,
-        vad: VADRuntimeStatus,
-        currentChunk: ChunkRecord?,
-        bytesRecordedToday: Int64,
-        recentHealth: [HealthEvent],
-        lastAudioAtUTC: Date?
-    ) {
-        self.capture = capture
-        self.vad = vad
-        self.currentChunk = currentChunk
-        self.bytesRecordedToday = bytesRecordedToday
-        self.recentHealth = recentHealth
-        self.lastAudioAtUTC = lastAudioAtUTC
-    }
 }
 
 /// The shadow capture pipeline state machine. Maps monitor/capture/VAD/writer events to
