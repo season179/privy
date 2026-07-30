@@ -1,0 +1,5 @@
+module COgg [system] {
+    header "shim.h"
+    link "ogg"
+    export *
+}

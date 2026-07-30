@@ -3,6 +3,8 @@
 
 # Xcode / Swift
 build/
+.build/
+dist/
 DerivedData/
 xcuserdata/
 *.xcuserstate
