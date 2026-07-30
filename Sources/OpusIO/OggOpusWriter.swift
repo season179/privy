@@ -81,10 +81,9 @@ public final class OggOpusWriter {
         }
     }
 
-    /// Pad the tail to a whole frame, mark end-of-stream, flush everything.
+    /// Pad the tail to a whole frame, mark end-of-stream, durably flush, and close.
     public func finish() throws {
         guard !finished else { return }
-        finished = true
         if !pending.isEmpty {
             pending.append(contentsOf: [Float](repeating: 0, count: frameSamples - pending.count))
         } else {
@@ -93,7 +92,32 @@ public final class OggOpusWriter {
         try encodeFrame(pending, endOfStream: true)
         pending.removeAll()
         try flushPages(force: true)
+        try handle.synchronize()
         try handle.close()
+        finished = true
+    }
+
+    /// Durably close an exactly frame-aligned stream without adding an Opus packet.
+    ///
+    /// Hourly rotation uses this path so the final granule position remains the exact
+    /// one-hour sample boundary. Ogg streams do not require an EOS packet to decode;
+    /// all packets already submitted are force-paged before the file is synchronized.
+    public func durablyCloseWithoutEndOfStream() throws {
+        guard !finished else { return }
+        guard pending.isEmpty else {
+            throw WriterError.io("EOS-less close requires a frame-aligned stream")
+        }
+        try flushPages(force: true)
+        try handle.synchronize()
+        try handle.close()
+        finished = true
+    }
+
+    /// Force all currently submitted packets to disk without closing the stream.
+    public func synchronize() throws {
+        precondition(!finished, "synchronize after finish")
+        try flushPages(force: true)
+        try handle.synchronize()
     }
 
     // MARK: - Internals
