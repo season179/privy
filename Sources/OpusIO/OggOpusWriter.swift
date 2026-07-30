@@ -26,7 +26,8 @@ public final class OggOpusWriter {
     private var granulePos: Int64 = 0  // 48 kHz units, per opus spec
     private var packetNo: Int64 = 0
     private var samplesSinceFlush = 0
-    private var finished = false
+    private var closePacketAttempted = false
+    private var closed = false
 
     public private(set) var totalSamples = 0
 
@@ -55,7 +56,7 @@ public final class OggOpusWriter {
     }
 
     deinit {
-        if !finished {
+        if !closed {
             // Crash-tolerant by design, but normal teardown should call finish().
             try? finish()
         }
@@ -66,7 +67,7 @@ public final class OggOpusWriter {
     /// Append mono float32 samples at `sampleRate`. Thread-unsafe by design —
     /// call from a single consumer (never the realtime audio callback, req 4).
     public func append(_ samples: [Float]) throws {
-        precondition(!finished, "append after finish")
+        precondition(!closePacketAttempted && !closed, "append after finish")
         pending.append(contentsOf: samples)
         totalSamples += samples.count
         while pending.count >= frameSamples {
@@ -83,18 +84,25 @@ public final class OggOpusWriter {
 
     /// Pad the tail to a whole frame, mark end-of-stream, durably flush, and close.
     public func finish() throws {
-        guard !finished else { return }
-        if !pending.isEmpty {
-            pending.append(contentsOf: [Float](repeating: 0, count: frameSamples - pending.count))
-        } else {
-            pending = [Float](repeating: 0, count: frameSamples)
+        guard !closed else { return }
+        if !closePacketAttempted {
+            var finalFrame = pending
+            if !finalFrame.isEmpty {
+                finalFrame.append(contentsOf: [Float](repeating: 0, count: frameSamples - finalFrame.count))
+            } else {
+                finalFrame = [Float](repeating: 0, count: frameSamples)
+            }
+            // Commit the close phase before encoding. If packet submission/page flush
+            // partially succeeds and throws, recovery retries only flush/sync/close and
+            // can never inject a second padded EOS packet.
+            pending.removeAll()
+            closePacketAttempted = true
+            try encodeFrame(finalFrame, endOfStream: true)
         }
-        try encodeFrame(pending, endOfStream: true)
-        pending.removeAll()
         try flushPages(force: true)
         try handle.synchronize()
         try handle.close()
-        finished = true
+        closed = true
     }
 
     /// Durably close an exactly frame-aligned stream without adding an Opus packet.
@@ -103,19 +111,19 @@ public final class OggOpusWriter {
     /// one-hour sample boundary. Ogg streams do not require an EOS packet to decode;
     /// all packets already submitted are force-paged before the file is synchronized.
     public func durablyCloseWithoutEndOfStream() throws {
-        guard !finished else { return }
+        guard !closed else { return }
         guard pending.isEmpty else {
             throw WriterError.io("EOS-less close requires a frame-aligned stream")
         }
         try flushPages(force: true)
         try handle.synchronize()
         try handle.close()
-        finished = true
+        closed = true
     }
 
     /// Force all currently submitted packets to disk without closing the stream.
     public func synchronize() throws {
-        precondition(!finished, "synchronize after finish")
+        precondition(!closePacketAttempted && !closed, "synchronize after finish")
         try flushPages(force: true)
         try handle.synchronize()
     }
