@@ -177,7 +177,7 @@ public struct AudioBlock16k: Sendable, Equatable {
     public let sequence: UInt64              // increments for every source callback, including dropped callbacks
     public let streamSampleStart: Int64      // normalized 16 kHz timeline; converted source gaps remain visible
     public let firstSampleTime: ClockReading
-    public let samples: [Float]              // mono, finite Float32 values, normally 20–100 ms
+    public let samples: [Float]              // mono, finite Float32; normally exactly 1600 samples/100 ms
 }
 
 public enum CaptureEvent: Sendable, Equatable {
@@ -202,9 +202,11 @@ public protocol AudioCapturing: Sendable {
 }
 ```
 
-The realtime tap is an explicitly typed `@Sendable` closure created by a `nonisolated` factory and captures only the preallocated ring producer plus atomic counters. It must not capture `self`, `@MainActor` state, an actor-isolated closure, `AsyncStream.Continuation`, the Store, or the logger. The tap copies native PCM and timing metadata into the ring and returns. The conversion consumer alone converts to 16 kHz mono and allocates/yields `AudioBlock16k.samples`; zero-allocation is required only in the realtime producer, not in downstream tasks.
+The realtime tap is an explicitly typed `@Sendable` closure created by a `nonisolated` factory and captures only the preallocated ring producer plus atomic counters. It must not capture `self`, `@MainActor` state, an actor-isolated closure, `AsyncStream.Continuation`, the Store, or the logger. The tap copies native PCM and timing metadata into the ring and returns. The conversion consumer alone converts to 16 kHz mono, packages normal output as 1600-sample/100 ms blocks, and allocates/yields `AudioBlock16k.samples`; zero-allocation is required only in the realtime producer, not in downstream tasks.
 
-The ring is single-producer/single-consumer, preallocated for at least 8 seconds at the active device format, and uses `ManagedAtomic` indices/counters. It never waits. On full capacity it rejects the newest callback as one unit, increments sequence/sample positions anyway, and atomically accumulates the exact dropped source-frame count. The consumer converts that count to duration and emits `.queueOverrun`; the next accepted block retains the timeline gap.
+`CaptureStreams.audio` is created with `.bufferingOldest(80)`, an additional bounded 8-second queue. The conversion consumer inspects every `continuation.yield(block)` result. On `.dropped(let block)`, it emits/coalesces `.queueOverrun` using that dropped block's normalized sample range and duration; on `.terminated`, it stops conversion. No converted audio is buffered without a fixed bound and drop telemetry.
+
+The ring is single-producer/single-consumer, preallocated for at least 8 seconds at the active device format, and uses `ManagedAtomic` indices/counters. It never waits. On full capacity it rejects the newest callback as one unit, increments sequence/sample positions anyway, and atomically accumulates the exact dropped source-frame count. The consumer converts that count to duration and emits `.queueOverrun`; the next accepted block retains the timeline gap. `RealtimeAudioRing` is explicitly permitted to be `@unchecked Sendable`; its inline safety proof must state single producer (tap), single consumer (drain task), acquire/release publication, and no resize or storage replacement after `installTap`.
 
 ### Store
 
@@ -213,7 +215,6 @@ public struct StorageLayout: Sendable, Equatable {
     public let rootDirectory: URL
     public let databaseURL: URL
     public let audioDirectory: URL
-    public let quarantineDirectory: URL
 }
 
 public enum ReconciliationActionKind: String, Sendable, Codable {
@@ -327,6 +328,15 @@ public protocol VADAnalyzing: Sendable {
 
 `ShadowChunkWriter` is an actor and is the only owner of an `OggOpusWriter`. Rotation is exactly 57,600,000 samples (one hour at 16 kHz); a block crossing the boundary is split so no sample is lost or duplicated. File order is: create DB row in `recording` → open `<name>.ogg.partial` → append/force Ogg pages → normal close and durable flush → atomic rename to `<name>.ogg` → SHA-256/size → DB state `ready`. Names contain UTC start plus UUID so orphan files remain attributable after a crash.
 
+`close(reason:)` has one mandatory terminal-state mapping:
+
+| `StopReason` | Required result before another chunk may open |
+|---|---|
+| `.manualPause`, `.systemSleep`, `.deviceChange`, `.restart`, `.shutdown` | Finish normally, rename, measure/checksum, and transition `recording → ready`. |
+| `.fatalError` | Stop accepting blocks and preserve the partial/final file; run same-process writer recovery. If `ffprobe` proves it decodable, measure the real file and transition to `ready`; otherwise call `failChunk` and leave the file preserved. |
+
+The same-process writer-recovery rule is blocking: after any append/flush/rename/checksum/Store failure, the pipeline must terminally transition the abandoned row to `ready` or `failed` before opening a replacement chunk. If the Store is unavailable and no terminal transition can be persisted, capture remains `.error` and no replacement writer opens. Startup reconciliation remains the fallback for process death during this recovery.
+
 The VAD adapter owns `VadManager`, `VadStreamState`, and `VadSegmentationConfig`. It accumulates incoming samples and calls `processStreamingChunk` with exactly 4096 samples (256 ms at 16 kHz), not the obsolete 30 ms assumption. This preserves one timestamped score per analysis window. It carries FluidAudio state across hour rotations; after an audio gap/drop/device restart it resets state and emits a health event instead of joining discontinuous audio. FluidAudio event sample indices are mapped to `AudioBlock16k.streamSampleStart`; the event attaches to the chunk whose interval contains that sample, including at rotation boundaries.
 
 ### Monitor, health, and pipeline state
@@ -365,12 +375,22 @@ public struct HealthDetail: Sendable, Codable, Equatable {
     public let durationIsEstimated: Bool
 }
 
+public struct HealthEnvelope: Sendable, Codable, Equatable {
+    public let severity: HealthSeverity
+    public let detail: HealthDetail
+}
+
 public struct HealthEvent: Sendable, Equatable {
     public let atUTC: Date
     public let kind: HealthKind
     public let severity: HealthSeverity
-    public let detail: HealthDetail           // Store encodes this as JSON in health.detail
+    public let detail: HealthDetail
 }
+```
+
+The locked `health.detail` column stores one `HealthEnvelope` JSON object with the exact shape `{"severity":"info|warning|error","detail":{...HealthDetail fields...}}`. `appendHealth` constructs the envelope from `HealthEvent`; every health read, including `menuSummary`, decodes the envelope and restores both top-level fields. Unknown/malformed envelopes fail decoding visibly rather than silently defaulting severity.
+
+```swift
 
 public enum CaptureReality: Sendable, Equatable {
     case starting, recording, paused(untilUTC: Date?), recovering(String), error(String), stopped
@@ -397,21 +417,23 @@ public protocol ShadowCaptureControlling: Sendable {
 
 Monitor implementations emit `MonitorEvent` only. `ShadowCapturePipeline` maps each monitor/capture/VAD/writer event to a persisted `HealthEvent`, performs the corresponding state transition, and then publishes a snapshot. Callback closures registered with NSWorkspace, CoreAudio, and AVAudioEngine are explicitly `@Sendable`, nonisolated, and capture only a Sendable event emitter.
 
-The capture state is observed reality. `.recording` requires a running engine, an open chunk, and an audio heartbeat less than 2 seconds old. Missing frames for 2 seconds triggers `.recovering` plus one restart attempt; at 5 seconds it becomes `.error` and persists a `.gap`. The menu icon is a pure rendering of `PipelineSnapshot.capture`, never of a requested or cached state.
+The capture state is observed reality. `.recording` requires a running engine, an open chunk, and an audio heartbeat less than 2 seconds old. GapWatchdog is armed only after entering `.recording` with a fresh heartbeat. It is synchronously disarmed and all pending deadlines are cancelled before every intentional engine stop: manual pause, `willSleep`, device-change rebuild, explicit restart, and shutdown. While armed, 2 seconds without frames triggers `.recovering` plus exactly one restart attempt; 5 seconds becomes `.error` and persists `.gap`.
+
+On `didWake`, the pipeline stays `.recovering` and starts a 10-second wake grace window with GapWatchdog disarmed. Sleep downtime is represented by exactly one `.sleep`, one `.wake`, and one measured `.gap` health sequence. The first post-wake audio heartbeat ends grace and arms the watchdog; if no heartbeat arrives by 10 seconds, wake recovery emits one separate error/gap and remains non-recording. The menu icon is a pure rendering of `PipelineSnapshot.capture`, never of a requested or cached state.
 
 ## Crash and lifecycle invariants
 
 1. **Startup:** create paths → migrate DB → reconcile filesystem/rows → start monitors → start shadow pipeline → publish `.recording` only after the first converted block has reached an open writer.
-2. **Sleep:** on `willSleep`, publish `.recovering("system sleep")`, persist `.sleep`, close the current chunk best-effort, and stop the engine. Ogg remains valid even if sleep wins the race. On `didWake`, persist `.wake`, re-enumerate input, rebuild converter/ring/engine, open a new chunk, and persist the measured gap.
+2. **Sleep:** on `willSleep`, disarm GapWatchdog first, publish `.recovering("system sleep")`, persist `.sleep`, close the current chunk best-effort, and stop the engine. Ogg remains valid even if sleep wins the race. On `didWake`, persist `.wake`, enter the defined 10-second grace window, re-enumerate input, rebuild converter/ring/engine, open a new chunk, and persist exactly one measured sleep gap; only fresh audio re-arms the watchdog.
 3. **Device change:** debounce the CoreAudio/device-list/configuration burst for 500 ms, transition out of `.recording`, close the current chunk, rebuild against the selected/default device format, restart, and log one structured `.deviceChange` plus `.engineRestart`. AirPods connect/disconnect is expected, not fatal.
-4. **Manual pause:** close the current file and stop capture. A `ContinuousClock` timer resumes a timed pause; wake also re-evaluates an expired wall deadline. Until-resumed has no timer. Paused time is intentional and represented by `recordingStopped`, not treated as an unexplained fault.
+4. **Manual pause:** disarm GapWatchdog before closing the current file and stopping capture. A `ContinuousClock` timer resumes a timed pause; wake also re-evaluates an expired wall deadline. Until-resumed has no timer. Paused time is intentional and represented by `recordingStopped`, not treated as an unexplained fault.
 5. **Kill/relaunch:** no shutdown hook is assumed. Reconciliation handles every crash window without deleting audio:
-   - `recording` row + `.partial`: preserve, atomically rename when non-empty, checksum, mark `ready` using the last checkpoint, and log `.recovery`.
-   - `recording` row + final `.ogg`: checksum and mark `ready`.
+   - `recording` row + `.partial`: preserve and atomically rename when non-empty; set `size_bytes` from the filesystem and `duration_s` from `ffprobe` decoded duration, then checksum and mark `ready`. If probing fails or the file is undecodable, preserve it and mark `failed`; never publish checkpoint-stale metadata as ready.
+   - `recording` row + final `.ogg`: likewise remeasure filesystem size and decoded duration, checksum, then mark `ready`; probing failure preserves the file as `failed`.
    - `recording`/`ready` row + no file: mark `failed` and log `.error`.
    - orphan final or partial file: create a matching `failed` row from the timestamp/UUID filename and log `.recovery`; never discard or overwrite it.
    - empty/unreadable files remain preserved and `failed` for inspection.
-6. **Normal rotation:** exactly one row is `recording`; old chunk is `ready` before the new chunk becomes the snapshot's current chunk. A DB or writer failure immediately leaves `.recording` UI state and keeps retry/recovery evidence.
+6. **Normal rotation and same-process recovery:** exactly one row is `recording`; old chunk is `ready` before the new chunk becomes the snapshot's current chunk. A DB or writer failure immediately leaves `.recording`, invokes the mandatory terminal-state recovery table, and opens no replacement until the old row is `ready` or `failed`.
 7. **Gap accounting:** source sequence/sample discontinuities, queue drops, engine downtime, sleep, and process recovery all produce structured health rows. Same-process durations use monotonic time; cross-process downtime is explicitly estimated from UTC and marked as such. No monitor or callback writes SQLite directly.
 
 ## Worker execution plan
@@ -430,11 +452,11 @@ All file ownership below is exclusive. A worker must not edit another worker's f
 
 **Scope**
 
-Materialize the shared declarations above; define `StorageLayout` rooted at `~/Library/Application Support/Privy` with `privy.sqlite`, `Audio/`, and `Quarantine/`; implement `SystemClock`; implement Sendable event emitters and NSWorkspace/CoreAudio monitors. Monitoring detects only and emits events. It does not restart capture or write health rows.
+Materialize the shared declarations above; define `StorageLayout` rooted at `~/Library/Application Support/Privy` with `privy.sqlite` and `Audio/`; implement `SystemClock`; implement Sendable event emitters and NSWorkspace/CoreAudio monitors. M1 deliberately has no quarantine directory: failed/suspect files remain preserved in place with failed rows. Monitoring detects only and emits events. It does not restart capture or write health rows.
 
 **Hard constraints**
 
-- Public cross-module values are `Sendable`; no `@unchecked Sendable` except a small event-emitter wrapper whose synchronization is explained inline.
+- Public cross-module values are `Sendable`; `@unchecked Sendable` is permitted only for the synchronized event-emitter wrapper and W3's `RealtimeAudioRing`, whose documented SPSC/atomic/no-resize invariant is its safety proof.
 - Notification/property-listener callbacks are explicit `@Sendable`, constructed in nonisolated code, and capture no main-actor closure.
 - Wall time is never used for duration math within a clock epoch.
 - Device notifications are debounced/coalesced but not silently discarded.
@@ -461,7 +483,7 @@ swift test --filter ClockAndMonitorTests
 
 **Scope**
 
-Implement `PrivyStoring` with `DatabasePool`, WAL, foreign keys, stable migrations, typed GRDB records, batched VAD inserts, health JSON persistence, menu summary queries, and deterministic startup reconciliation. Keep `ReconciliationPlanner` pure: DB/file inventory in, ordered actions/report out; `PrivyStore` applies the plan idempotently.
+Implement `PrivyStoring` with `DatabasePool`, WAL, foreign keys, stable migrations, typed GRDB records, batched VAD inserts, exact `HealthEnvelope` JSON persistence, menu summary queries, and deterministic startup reconciliation. Keep `ReconciliationPlanner` pure: DB/file inventory in, ordered actions/report out; `PrivyStore` applies the plan idempotently. Recovery uses filesystem attributes plus `ffprobe` decoded duration rather than checkpoint metadata before a preserved file may become `ready`.
 
 **Hard constraints**
 
@@ -469,13 +491,14 @@ Implement `PrivyStoring` with `DatabasePool`, WAL, foreign keys, stable migratio
 - State changes use guarded SQL updates (`WHERE state = expected`) so duplicate finalize/reconcile calls cannot regress state.
 - No recovered audio is deleted. Relative paths cannot escape `StorageLayout.audioDirectory`.
 - `prepareDatabase` and `reconcile` are safe to run repeatedly after interruption.
+- If `ffprobe` is unavailable, fails, or reports an undecodable recovered file, preserve it and mark its row `failed`; never guess ready duration/size from the stale checkpoint.
 - Tests use temporary directories/databases; no test touches the live app-support directory.
 
 **Acceptance criteria**
 
 - A fresh DB has every §5 table, FTS5 table, index, and migration record.
-- CRUD tests cover chunk create/checkpoint/finalize/fail, VAD batches, health, and day/menu summary boundaries.
-- Reconciliation tests cover all five crash cases above, repeated reconciliation, path traversal, duplicate UUID filenames, missing files, and DB/file-operation failure midway.
+- CRUD tests cover chunk create/checkpoint/finalize/fail, VAD batches, health, and day/menu summary boundaries; a required health round-trip persists each severity through the `HealthEnvelope` and verifies `menuSummary` restores it unchanged.
+- Reconciliation tests cover all five crash cases above, real filesystem size/decoded duration replacing stale checkpoints, probe failure → preserved `failed`, repeated reconciliation, path traversal, duplicate UUID filenames, missing files, and DB/file-operation failure midway.
 - After reconciliation every preserved audio file has a row and no row remains `recording` unless a live writer explicitly owns it.
 
 **Verification**
@@ -495,13 +518,13 @@ swift test --filter ReconciliationTests
 
 **Scope**
 
-Implement the preallocated lock-free SPSC ring, the dedicated drain/conversion loop, one stateful `AVAudioConverter` path to 16 kHz mono Float32, AVAudioEngine lifecycle, input-device selection/default fallback, and engine-configuration event emission. Ring metadata preserves callback sequence, source sample position, source format, and host timestamp so conversion latency does not become capture time.
+Implement the preallocated lock-free SPSC ring, the dedicated drain/conversion loop, one stateful `AVAudioConverter` path to 16 kHz mono Float32 packaged as 100 ms blocks, the bounded `.bufferingOldest(80)` conversion-to-pipeline stream, AVAudioEngine lifecycle, input-device selection/default fallback, and engine-configuration event emission. Ring metadata preserves callback sequence, source sample position, source format, and host timestamp so conversion latency does not become capture time.
 
 **Hard constraints**
 
 - The tap closure follows the audio contract literally: explicit `@Sendable`, nonisolated creation, no `self`, actor, allocation, lock, wait, task creation, conversion, logging, SQLite, or file I/O.
 - Ring storage is allocated before `installTap`; producer uses acquire/release atomics and bounded copies only.
-- Overflow drops the newest whole callback and accounts exact dropped frames/duration; no partial block and no overwrite of unread storage.
+- Ring overflow drops the newest whole callback and accounts exact dropped frames/duration; no partial block and no overwrite of unread storage. Converted-stream overflow is detected by inspecting every `yield` result and coalesced into `.queueOverrun` with the dropped normalized block range.
 - Restart creates a new `captureEpoch`, drains/discards old-format slots explicitly, and never feeds mixed formats into one converter.
 - `stop`/`restart` are idempotent under notification bursts.
 
@@ -509,7 +532,7 @@ Implement the preallocated lock-free SPSC ring, the dedicated drain/conversion l
 
 - Deterministic ring tests cover empty/full/wraparound, sequence gaps, overflow counters, maximum callback size, and producer faster than consumer.
 - Thread-sanitized stress runs show no race while producing and consuming millions of samples.
-- Converter tests cover 48 kHz stereo, 44.1 kHz mono, non-integer resampling boundaries, finite output, channel mixing, continuity across blocks, and reset after format change.
+- Converter tests cover 48 kHz stereo, 44.1 kHz mono, non-integer resampling boundaries, finite output, channel mixing, 1600-sample packaging, continuity across blocks, and reset after format change; a bounded-stream test fills all 80 slots and proves each rejected block produces exact overrun telemetry.
 - Capture start with no input reports `inputUnavailable` instead of claiming success.
 
 **Verification**
@@ -533,20 +556,22 @@ swift test --sanitize=thread --filter RealtimeAudioRingTests
 
 Implement the Store-backed rotating writer, 256 ms FluidAudio adapter, independent bounded VAD lane, heartbeat/gap watchdog, pipeline state machine, pause/resume, health mapping, and snapshots. Keep writer progress ahead of VAD: pipeline writes each block first, then nonblocking-yields a copy to the VAD lane. A full VAD lane resets VAD continuity and logs `vadGap`; it never delays the writer.
 
+Inside `VADService.swift`, declare an internal `VADModelProcessing: Sendable` seam with an associated Sendable stream-state type and exactly two operations: `makeStreamState()` and `processStreamingChunk(_:state:config:) -> updated state + probability + optional boundary`. `VADService` is generic over this seam. A concrete actor adapter wraps `VadManager`; unit tests inject a deterministic fake and only `FluidAudioVADSmokeTests` constructs the real model/download path.
+
 **Hard constraints**
 
-- `OggOpusWriter` remains single-owner/thread-unsafe and lives only inside the writer actor; normal finish durably synchronizes before close/rename, while crash-truncated behavior remains valid. Its current `finish()` injects a full zero frame when no PCM tail exists, so W4 must add/use a close path that does not synthesize 20 ms at exact rotation boundaries; partial tails may be padded for Opus while persisted duration remains the real input-sample duration.
+- `OggOpusWriter` remains single-owner/thread-unsafe and lives only inside the writer actor; normal finish durably synchronizes before close/rename, while crash-truncated behavior remains valid. For exact one-hour rotation, W4 adds an EOS-less durable close that flushes existing pages, leaves granule position unchanged, and injects no packet; the spike already proved EOS-less/truncated Ogg decodes. Nonaligned closes may pad at most one 20 ms Opus frame while persisted duration remains the real input-sample duration.
 - One-hour rotation splits a crossing block exactly; sample conservation is asserted in tests.
-- `VadManager` initialization/download runs off the main actor. Capture continues during `.preparingModel` and after `.failed`.
+- `VadManager` initialization/download runs off the main actor. Capture continues during `.preparingModel` and after `.failed`; logic unit tests use `VADModelProcessing`, never network/model loading.
 - VAD calls receive exact 4096-sample windows; leftover samples carry forward. FluidAudio's returned state is passed unchanged to the next window. All event/sample-to-chunk mapping uses source sample/monotonic positions, not task completion time.
-- A stalled/dead capture cannot publish `.recording` beyond the 2/5-second watchdog thresholds.
+- GapWatchdog follows the contract's arm/disarm rules exactly: intentional stop paths disarm before stopping, successful wake gets a 10-second grace window, and only a fresh heartbeat re-arms it. A stalled/dead capture outside grace cannot publish `.recording` beyond the 2/5-second thresholds.
 
 **Acceptance criteria**
 
-- Writer tests prove temp/final ordering, hourly split without loss/duplication, checksum/size/state updates, idempotent close, write/rename/DB failures, and decodability of clean and deliberately unfinalized output.
-- VAD tests prove arbitrary input block sizes become exact 4096-sample calls, carry state, timestamp scores, map boundaries across chunk rotation, and reset after gaps.
+- Writer tests prove temp/final ordering, hourly split without loss/duplication, checksum/size/state updates, every close-reason terminal mapping, same-process writer recovery before replacement, idempotent close, write/rename/DB failures, and decodability of clean and deliberately unfinalized output. The EOS-less rotation file must play through the rotation point, and `ffprobe` duration must match persisted duration within one 20 ms frame.
+- Fake-backed VAD tests prove arbitrary input block sizes become exact 4096-sample model calls, carry state, timestamp scores, map boundaries across chunk rotation, and reset after gaps.
 - The opt-in real-model smoke test handles both cached and first-download paths and verifies offline reuse after caching.
-- Pipeline tests with delayed/failing VAD prove audio writing continues; fake-clock tests cover pause, sleep/wake, device restart, overrun, heartbeat loss, and truthful snapshot transitions.
+- Pipeline tests with delayed/failing VAD prove audio writing continues; fake-clock tests cover device restart, overrun, heartbeat loss, and truthful snapshots. Two named tests are mandatory: pausing for one fake-clock hour produces zero `.gap`, `.error`, or watchdog restart events; waking after a long sleep and receiving audio within grace produces exactly one `.sleep`, one `.wake`, one measured sleep `.gap`, and no watchdog fault.
 
 **Verification**
 
@@ -573,7 +598,7 @@ Replace the spike startup with `AppCoordinator`, the sole composition root. It c
 
 The `MenuBarExtra` label and menu implement recording/paused/recovering/error icons; exact status text; current chunk elapsed time; today's disk bytes; last three health events; Pause 15 min / 1 h / until resumed; Resume; launch-at-login toggle; reveal audio/log location; and Quit. `Quit` awaits orderly pipeline shutdown before terminating. VAD preparation appears as secondary text such as “Recording — preparing speech model,” never as capture failure.
 
-`scripts/verify-m1.sh` is read-only. Given DB/audio paths and a time window, it checks migration presence, stuck `recording` rows, orphan `.partial`/`.ogg` files, missing row files, zero-byte files, `ffprobe` decodability, chunk ordering, and gaps over 5 seconds without an overlapping structured health event. It exits nonzero with actionable rows/files; it never repairs or deletes. `--self-test` creates and removes a temporary SQLite/audio fixture using `sqlite3` and `ffmpeg`, exercises one passing case plus each failing invariant, and never reads live app data.
+`scripts/verify-m1.sh` is read-only. Given DB/audio paths and a time window, it checks migration presence, stuck `recording` rows, orphan `.partial`/`.ogg` files, missing row files, zero-byte files, `ffprobe` decodability, chunk ordering, and **inter-chunk** gaps over 5 seconds without an overlapping structured health event. It also reports persisted `.queueOverrun` counts/durations but does not claim to independently detect unlogged holes inside an Ogg file. It exits nonzero with actionable rows/files; it never repairs or deletes. `--self-test` creates and removes a temporary SQLite/audio fixture using `sqlite3` and `ffmpeg`, exercises one passing case plus each failing invariant, and never reads live app data.
 
 **Hard constraints**
 
@@ -666,7 +691,7 @@ M1 passes only when all of the following are true:
 
 - Every non-empty audio file is represented by exactly one chunk row; no row remains `recording`; no ready row lacks a file; crash-preserved files are decodable or explicitly `failed` and preserved.
 - Normal files average approximately 10 MB/hour at 24 kbps and rotate at one hour without sample loss/duplication.
-- The audit finds no inferred gap over 5 seconds lacking a corresponding sleep, pause, device-change, restart, queue-overrun, recovery, or error health event.
+- The audit finds no **inter-chunk** gap over 5 seconds lacking a corresponding sleep, pause, device-change, restart, recovery, or error health event. Within-chunk integrity is instead enforced by W3 sequence/sample accounting tests and surfaced persisted `.queueOverrun` telemetry; the script reports that telemetry but cannot independently infer an unlogged in-file hole.
 - VAD score density is approximately one row per 256 ms of VAD-covered audio, excluding explicit `vadGap` intervals; speech boundary events have valid chunk-relative mappings.
 - Health history proves lid-close, AirPods transitions, `kill -9`, input failure, and recovery. The menu was manually observed to leave recording immediately for each induced fault and return only after a real audio heartbeat.
 - Launch-at-login still starts the signed app with microphone access and capture after logout/login.
