@@ -792,7 +792,13 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         ))
 
         #expect(await waitUntil {
-            (await fixture.store.allHealth()).contains { $0.kind == .vadError && $0.detail.message.contains("processing") }
+            let healthPersisted = (await fixture.store.allHealth()).contains {
+                $0.kind == .vadError && $0.detail.message.contains("processing")
+            }
+            guard healthPersisted, let latest = await fixture.snapshots.latest() else { return false }
+            guard case .recording = latest.capture else { return false }
+            guard case .failed = latest.vad else { return false }
+            return true
         })
         #expect((await fixture.store.allChunks()).contains { $0.state == .recording })
         let latest = await fixture.snapshots.latest()
@@ -828,9 +834,13 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         }
 
         #expect(await waitUntil {
-            (await fixture.store.allHealth()).contains {
+            let healthPersisted = (await fixture.store.allHealth()).contains {
                 $0.kind == .vadError && $0.detail.message.contains("could not be persisted")
             }
+            guard healthPersisted, let latest = await fixture.snapshots.latest() else { return false }
+            guard case .recording = latest.capture else { return false }
+            guard case .failed = latest.vad else { return false }
+            return true
         })
         let latest = await fixture.snapshots.latest()
         if case .recording = latest?.capture {} else {
