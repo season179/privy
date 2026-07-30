@@ -254,7 +254,7 @@ actor ShadowChunkWriter: ShadowChunkWriting {
             if !fileManager.fileExists(atPath: current.finalURL.path) {
                 try movePartialToFinal(current)
             }
-            let measuredDuration = try probeDuration(at: current.finalURL)
+            let measuredDuration = try await probeDuration(at: current.finalURL)
             let size = try fileSize(at: current.finalURL)
             let checksum = try checksumSHA256(at: current.finalURL)
             _ = try await store.finalizeChunk(
@@ -319,32 +319,17 @@ actor ShadowChunkWriter: ShadowChunkWriting {
         return hash.finalize().map { String(format: "%02x", $0) }.joined()
     }
 
-    private func probeDuration(at url: URL) throws -> Double {
+    private func probeDuration(at url: URL) async throws -> Double {
         guard let executable = executable(named: "ffprobe") else {
             throw ChunkWriterError.terminalRecoveryRequired("ffprobe is unavailable")
         }
-        let process = Process()
-        let output = Pipe()
-        let errors = Pipe()
-        process.executableURL = executable
-        process.arguments = [
-            "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1",
-            url.path,
-        ]
-        process.standardOutput = output
-        process.standardError = errors
-        try process.run()
-        process.waitUntilExit()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
-        guard process.terminationStatus == 0,
-              let text = String(data: data, encoding: .utf8),
+        let result = try await FFprobeRunner().run(executable: executable, audioURL: url)
+        guard result.status == 0,
+              let text = String(data: result.output, encoding: .utf8),
               let duration = Double(text.trimmingCharacters(in: .whitespacesAndNewlines)),
               duration.isFinite,
               duration > 0 else {
-            let detail = String(data: errorData, encoding: .utf8) ?? "unknown ffprobe error"
+            let detail = String(data: result.errors, encoding: .utf8) ?? "unknown ffprobe error"
             throw ChunkWriterError.terminalRecoveryRequired("ffprobe failed: \(detail)")
         }
         return duration
@@ -409,5 +394,56 @@ actor ShadowChunkWriter: ShadowChunkWriting {
             checksumSHA256: checksum,
             state: state
         )
+    }
+}
+
+private actor FFprobeRunner {
+    struct Result: Sendable {
+        let status: Int32
+        let output: Data
+        let errors: Data
+    }
+
+    private var process: Process?
+
+    func run(executable: URL, audioURL: URL) async throws -> Result {
+        let process = Process()
+        let output = Pipe()
+        let errors = Pipe()
+        process.executableURL = executable
+        process.arguments = [
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            audioURL.path,
+        ]
+        process.standardOutput = output
+        process.standardError = errors
+        self.process = process
+
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                process.terminationHandler = { completed in
+                    continuation.resume(returning: Result(
+                        status: completed.terminationStatus,
+                        output: output.fileHandleForReading.readDataToEndOfFile(),
+                        errors: errors.fileHandleForReading.readDataToEndOfFile()
+                    ))
+                }
+                do {
+                    try process.run()
+                } catch {
+                    process.terminationHandler = nil
+                    continuation.resume(throwing: error)
+                }
+            }
+        } onCancel: {
+            Task { await self.terminate() }
+        }
+    }
+
+    private func terminate() {
+        guard let process, process.isRunning else { return }
+        process.terminate()
     }
 }
