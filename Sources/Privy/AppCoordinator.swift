@@ -184,7 +184,7 @@ actor AppCoordinator {
     }
 
     /// Stops event ingress before asking the pipeline to close its writer. This prevents
-    /// a monitor event from initiating CaptureEngine's debounced restart after pipeline
+    /// a monitor event from initiating a debounced capture restart after pipeline
     /// shutdown has begun.
     private func tearDownRuntime() async {
         guard lifecycle != .shuttingDown, lifecycle != .stopped else { return }

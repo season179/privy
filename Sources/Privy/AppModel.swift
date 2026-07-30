@@ -37,7 +37,11 @@ final class AppModel {
         do {
             try LoginItem.setEnabled(enabled)
             launchAtLoginEnabled = LoginItem.isRegistered
-            loginItemError = nil
+            if enabled, !launchAtLoginEnabled {
+                loginItemError = "Allow Privy in System Settings → General → Login Items."
+            } else {
+                loginItemError = nil
+            }
         } catch {
             launchAtLoginEnabled = LoginItem.isRegistered
             loginItemError = "Launch at login could not be changed: \(error.localizedDescription)"
@@ -111,8 +115,11 @@ final class AppModel {
     }
 
     var currentChunkElapsed: String {
-        guard let seconds = snapshot?.currentChunk?.durationSeconds else { return "—" }
-        return Self.duration(seconds)
+        guard let snapshot, let chunk = snapshot.currentChunk else { return "—" }
+        let heartbeatElapsed = snapshot.lastAudioAtUTC.map {
+            max(0, $0.timeIntervalSince(chunk.startedAtUTC))
+        } ?? 0
+        return Self.duration(max(chunk.durationSeconds, heartbeatElapsed))
     }
 
     var bytesRecordedToday: String {
