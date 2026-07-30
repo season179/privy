@@ -185,12 +185,18 @@ internal final class AudioConverter16k {
     /// Flushes a short terminal package without inventing samples, then clears all
     /// converter state. Capture restart constructs a new converter for the new format.
     internal func finish() -> [AudioBlock16k] {
+        discardPendingPackage().map { [$0] } ?? []
+    }
+
+    /// Claims and clears valid converted samples that cannot be delivered after a
+    /// conversion/stream failure. The caller must surface this exact block as a drop.
+    internal func discardPendingPackage() -> AudioBlock16k? {
         let partial = takePartialPackage()
         converter.reset()
         feeder.reset()
         expectedNextSourceFrame = nil
         outputCursor = 0
-        return partial.map { [$0] } ?? []
+        return partial
     }
 
     private func makeMonoInput(_ source: AVAudioPCMBuffer) throws -> AVAudioPCMBuffer {
