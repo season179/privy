@@ -102,9 +102,10 @@ extension BoundedProcessError {
 }
 
 /// Runs an external process, capturing stdout, and guarantees it terminates within
-/// `timeout`. Waiting is done off the calling actor via `terminationHandler` + a detached
-/// timeout task; the caller `await`s and is never busily polled (finding 8). A timed-out
-/// child is sent `terminate` and then `interrupt` if still running, then reaped.
+/// `timeout`. Natural exit, timeout, and caller cancellation contend for one lock-protected
+/// outcome. The winning path reaps/cleans the process and closes every pipe handle before
+/// resuming the caller; natural exit also cancels and awaits the timeout arm so it cannot
+/// retain descriptors until the deadline.
 enum BoundedProcess {
     enum Outcome: Sendable {
         case success(Data)
@@ -112,70 +113,230 @@ enum BoundedProcess {
     }
 
     static func run(executable: String, arguments: [String], timeout: Duration) async -> Outcome {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        let stdout = Pipe()
-        process.standardOutput = stdout
-        process.standardError = Pipe()
-
-        do {
-            try process.run()
-        } catch {
-            return .failure(.launchFailed(error.localizedDescription))
-        }
-
-        // Exactly one of {natural exit, timeout} atomically claims the single outcome slot
-        // and is solely responsible for classifying + resuming. There is no separate flag
-        // a natural exit can be suppressed by, so a successful probe cannot be misclassified
-        // as a timeout (finding 3).
-        let state = ProbeState()
-        return await withCheckedContinuation { (continuation: CheckedContinuation<Outcome, Never>) in
-            process.terminationHandler = { proc in
-                let data = stdout.fileHandleForReading.readDataToEndOfFile()
-                guard state.claim() else { return }  // timeout task owns the outcome
-                if proc.terminationStatus == 0 {
-                    continuation.resume(returning: .success(data))
-                } else {
-                    continuation.resume(returning: .failure(.nonzeroExit(proc.terminationStatus)))
-                }
-            }
-            // Detached timeout: if the process already exited naturally by the deadline, defer
-            // to its terminationHandler (it owns the outcome). Otherwise atomically claim,
-            // then escalate SIGTERM -> SIGINT -> SIGKILL (a signal a child cannot trap),
-            // reaping deterministically. SIGKILL guarantees prompt death, so the final
-            // waitUntilExit is bounded. The natural handler contests the same one-shot claim
-            // (it does not read a separate flag), so it can never be suppressed.
-            Task.detached(priority: .userInitiated) {
-                let nanos = UInt64(max(0, timeout.components.seconds)) * 1_000_000_000
-                    + UInt64(max(0, timeout.components.attoseconds / 1_000_000_000))
-                try? await Task.sleep(nanoseconds: nanos)
-                guard process.isRunning else { return }              // finished in time
-                guard state.claim() else { return }                 // natural exit won the claim
-                if process.isRunning { process.terminate() }        // SIGTERM
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                if process.isRunning { process.interrupt() }        // SIGINT
-                try? await Task.sleep(nanoseconds: 150_000_000)
-                if process.isRunning {
-                    _ = kill(process.processIdentifier, SIGKILL)   // SIGKILL: untrappable
-                }
-                process.waitUntilExit()  // reap; bounded because SIGKILL cannot be caught
-                continuation.resume(returning: .failure(.timedOut))
-            }
+        let execution = ProcessExecution(executable: executable, arguments: arguments)
+        return await withTaskCancellationHandler {
+            await execution.start(timeout: timeout)
+        } onCancel: {
+            // Task-group cancellation at the inventory deadline must become real process
+            // termination; cancellation alone would make the group wait for a hung child.
+            execution.cancel()
         }
     }
 }
 
-/// A one-shot outcome claim for a bounded process run. The first caller to win `claim()`
-/// owns classification and the continuation resume; everyone else defers. All access is
-/// serialized through `lock`; `@unchecked Sendable` is justified by that lock.
-private final class ProbeState: @unchecked Sendable {
+/// Owns one `Process` invocation. `@unchecked Sendable` is justified because outcome,
+/// continuation, timeout-task, and launch state are accessed only while holding `lock`.
+private final class ProcessExecution: @unchecked Sendable {
+    private enum Claim {
+        case pending
+        case naturalExit
+        case timeout
+    }
+
+    private struct Ownership {
+        let continuation: CheckedContinuation<BoundedProcess.Outcome, Never>
+        let timeoutTask: Task<Void, Never>?
+    }
+
     private let lock = NSLock()
-    private var claimed = false
-    func claim() -> Bool {
+    private let process = Process()
+    private let stdout = Pipe()
+    private var claim: Claim = .pending
+    private var continuation: CheckedContinuation<BoundedProcess.Outcome, Never>?
+    private var timeoutTask: Task<Void, Never>?
+    private var launchFinished = false
+    private var cancellationRequested = false
+
+    init(executable: String, arguments: [String]) {
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        process.standardOutput = stdout
+        // ffprobe diagnostics are intentionally classified by exit status, not captured.
+        // Using the null device also prevents an unread stderr pipe from filling and
+        // deadlocking a verbose child before timeout can terminate it.
+        process.standardError = FileHandle.nullDevice
+    }
+
+    func start(timeout: Duration) async -> BoundedProcess.Outcome {
+        await withCheckedContinuation { (continuation: CheckedContinuation<BoundedProcess.Outcome, Never>) in
+            install(continuation)
+            process.terminationHandler = { [weak self] process in
+                self?.naturalExit(process)
+            }
+
+            if cancellationWasRequested() {
+                finishWithoutLaunchAsTimeout()
+                return
+            }
+
+            do {
+                try process.run()
+            } catch {
+                finishLaunchFailure(error)
+                return
+            }
+
+            let cancelledDuringLaunch = markLaunchFinished()
+            if cancelledDuringLaunch {
+                cancel()
+            } else {
+                armTimeout(after: timeout)
+            }
+        }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancellationRequested = true
+        guard launchFinished, let ownership = claimLocked(.timeout) else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        ownership.timeoutTask?.cancel()
+        Task.detached(priority: .userInitiated) { [self] in
+            if let timeoutTask = ownership.timeoutTask {
+                await timeoutTask.value
+            }
+            await terminateReapAndFinish(continuation: ownership.continuation)
+        }
+    }
+
+    private func install(_ continuation: CheckedContinuation<BoundedProcess.Outcome, Never>) {
         lock.lock(); defer { lock.unlock() }
-        if claimed { return false }
-        claimed = true
-        return true
+        self.continuation = continuation
+    }
+
+    private func cancellationWasRequested() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return cancellationRequested
+    }
+
+    private func markLaunchFinished() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        launchFinished = true
+        return cancellationRequested
+    }
+
+    private func armTimeout(after timeout: Duration) {
+        let task = Task.detached(priority: .userInitiated) { [self] in
+            do {
+                try await Task.sleep(for: timeout)
+            } catch {
+                return
+            }
+            await timeoutReached()
+        }
+
+        lock.lock()
+        if case .pending = claim {
+            timeoutTask = task
+            lock.unlock()
+        } else {
+            lock.unlock()
+            task.cancel()
+        }
+    }
+
+    private func naturalExit(_ terminatedProcess: Process) {
+        lock.lock()
+        guard let ownership = claimLocked(.naturalExit) else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+
+        // Claim before draining stdout: once termination is observed, timeout cannot win
+        // while the handler is reading the final output bytes.
+        ownership.timeoutTask?.cancel()
+        Task.detached(priority: .userInitiated) { [self] in
+            if let timeoutTask = ownership.timeoutTask {
+                await timeoutTask.value
+            }
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            cleanupHandles()
+            if terminatedProcess.terminationStatus == 0 {
+                ownership.continuation.resume(returning: .success(data))
+            } else {
+                ownership.continuation.resume(
+                    returning: .failure(.nonzeroExit(terminatedProcess.terminationStatus))
+                )
+            }
+        }
+    }
+
+    private func timeoutReached() async {
+        guard let ownership = claimTimeout() else { return }
+        // This method is running in the timeout arm itself; release that stored task but do
+        // not attempt to await it from itself.
+        await terminateReapAndFinish(continuation: ownership.continuation)
+    }
+
+    private func claimTimeout() -> Ownership? {
+        lock.lock(); defer { lock.unlock() }
+        return claimLocked(.timeout)
+    }
+
+    /// Must be called with `lock` held. Exactly one contender receives ownership of the
+    /// continuation and timeout arm; all later natural-exit/timeout/cancel paths defer.
+    private func claimLocked(_ winner: Claim) -> Ownership? {
+        guard case .pending = claim, let continuation else { return nil }
+        claim = winner
+        self.continuation = nil
+        let timeoutTask = self.timeoutTask
+        self.timeoutTask = nil
+        return Ownership(continuation: continuation, timeoutTask: timeoutTask)
+    }
+
+    private func finishWithoutLaunchAsTimeout() {
+        lock.lock()
+        launchFinished = true
+        guard let ownership = claimLocked(.timeout) else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        cleanupHandles()
+        ownership.continuation.resume(returning: .failure(.timedOut))
+    }
+
+    private func finishLaunchFailure(_ error: Error) {
+        lock.lock()
+        launchFinished = true
+        guard let ownership = claimLocked(.naturalExit) else {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        ownership.timeoutTask?.cancel()
+        cleanupHandles()
+        ownership.continuation.resume(
+            returning: .failure(.launchFailed(error.localizedDescription))
+        )
+    }
+
+    private func terminateReapAndFinish(
+        continuation: CheckedContinuation<BoundedProcess.Outcome, Never>
+    ) async {
+        if process.isRunning { process.terminate() }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        if process.isRunning { process.interrupt() }
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        if process.isRunning {
+            _ = kill(process.processIdentifier, SIGKILL)
+        }
+        process.waitUntilExit()
+        cleanupHandles()
+        continuation.resume(returning: .failure(.timedOut))
+    }
+
+    private func cleanupHandles() {
+        // Foundation forbids changing standardOutput/standardError after launch. Closing both
+        // retained pipe handles and clearing the callback breaks the retention chain while
+        // the Process object itself is released with this execution.
+        process.terminationHandler = nil
+        try? stdout.fileHandleForReading.close()
+        try? stdout.fileHandleForWriting.close()
     }
 }

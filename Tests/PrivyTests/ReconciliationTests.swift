@@ -623,35 +623,61 @@ private func files(in dir: URL) -> [String] {
         }
     }
 
-    @Test func manyProbesDoNotBlockReconcileProgress() async throws {
-        // A slow probe is `await`ed off the actor (never busily polled on it). Reconcile
-        // over many such files finishes in bounded wall-time — not N × a real 10s probe —
-        // proving the actor yields per probe rather than blocking serially for the full
-        // probe lifetime. (BoundedProcess's own timeout/reap behavior is covered separately
-        // in AudioProbeTests; this test asserts the wall-time bound on the reconcile path.)
+    @Test func hungProbeInventoryHasFixedDeadlineIndependentOfFileCount() async throws {
+        // Each probe suspends for 30 seconds unless cancellation reaches it. Compare two
+        // inventories larger than the four-probe concurrency limit: both must stop at the
+        // same inventory-wide deadline rather than taking ceil(N/4) timeout windows.
+        let small = try await runHungProbeInventory(fileCount: 8)
+        let large = try await runHungProbeInventory(fileCount: 40)
+
+        for run in [small, large] {
+            #expect(run.elapsed < 1.5, "inventory deadline must return promptly; took \(run.elapsed)s")
+            #expect(run.started == 4, "only the bounded in-flight probes should start; got \(run.started)")
+            #expect(run.peakConcurrent == 4, "probes must execute concurrently at width four")
+            #expect(run.cancelled == 4, "every in-flight hung probe must observe cancellation")
+            #expect(run.recordingRows == 0, "every unfinished probe must be classified failed/preserved")
+            #expect(run.preservedFiles == run.fileCount, "deadline must preserve every audio file")
+        }
+        #expect(
+            abs(small.elapsed - large.elapsed) < 0.5,
+            "total probe time must not scale with file count (small \(small.elapsed)s, large \(large.elapsed)s)"
+        )
+    }
+
+    private func runHungProbeInventory(fileCount: Int) async throws -> HungInventoryRun {
         let root = FileManager.default.temporaryDirectory
-            .appendingPathComponent("privy-recon-slow-\(UUID().uuidString)", isDirectory: true)
+            .appendingPathComponent("privy-recon-hung-\(UUID().uuidString)", isDirectory: true)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let layout = AppPaths.layout(rootedAt: root)
         try AppPaths.ensureDirectoriesExist(layout)
-        let trigger = PrivyWriteFailureTrigger()
-        // 40ms/probe fake; each represents a probe that must be bounded-yielded.
-        let store = try PrivyStore(databaseURL: layout.databaseURL, audioProbe: SlowProbe(perProbeSeconds: 0.04), writeFailureTrigger: trigger)
+        let probe = CancellationAwareHungProbe()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL,
+            audioProbe: probe,
+            writeFailureTrigger: PrivyWriteFailureTrigger(),
+            inventoryProbeDeadline: .milliseconds(200)
+        )
         try await store.prepareDatabase()
-        let n = 20
-        for i in 0..<n {
-            let rel = "2026-07-30T00-00-0\(i % 10)-\(i).ogg"
+        for i in 0..<fileCount {
+            let rel = "2026-07-30T00-00-00-\(i).ogg"
             _ = try await store.createChunk(newChunk(path: rel))
-            try writeValidOgg(at: audioURL(layout, rel + ".partial"), durationSeconds: 0.5)
+            try Data([0x01]).write(to: audioURL(layout, rel + ".partial"))
         }
 
-        let start = Date()
+        let startedAt = Date()
         _ = try await store.reconcile(storage: layout, at: reading())
-        let elapsed = Date().timeIntervalSince(start)
-        // 20 × 40ms ≈ 0.8s if yielded per probe; must be far below 20 × a real 10s probe.
-        #expect(elapsed < 6.0, "reconcile over many slow probes must be bounded; took \(elapsed)s")
-        #expect(try countRows(layout.databaseURL.path, whereClause: "state='recording'") == 0)
+        let elapsed = Date().timeIntervalSince(startedAt)
+        let metrics = probe.metrics
+        return HungInventoryRun(
+            fileCount: fileCount,
+            elapsed: elapsed,
+            started: metrics.started,
+            peakConcurrent: metrics.peakConcurrent,
+            cancelled: metrics.cancelled,
+            recordingRows: try countRows(layout.databaseURL.path, whereClause: "state='recording'"),
+            preservedFiles: files(in: layout.audioDirectory).count
+        )
     }
 
     // MARK: - Pure planner (synthetic inventories)
@@ -787,14 +813,59 @@ private struct LyingProbe: AudioProbing {
     func probe(durationOf url: URL) async -> AudioProbeResult { .decodable(durationSeconds: 1.0) }
 }
 
-/// A probe that sleeps before returning, simulating a slow/hung probe that must be
-/// bounded-yielded rather than busily polled on the Store actor.
-private struct SlowProbe: AudioProbing {
-    let perProbeSeconds: Double
+/// Measurements captured from one deadline-bounded reconciliation run.
+private struct HungInventoryRun {
+    let fileCount: Int
+    let elapsed: TimeInterval
+    let started: Int
+    let peakConcurrent: Int
+    let cancelled: Int
+    let recordingRows: Int
+    let preservedFiles: Int
+}
+
+/// A probe that can finish only through task cancellation. Counters prove the inventory
+/// runner starts exactly four probes concurrently, cancels each at the common deadline, and
+/// never starts later batches after that deadline.
+private final class CancellationAwareHungProbe: AudioProbing, @unchecked Sendable {
+    private let lock = NSLock()
+    private var startedCount = 0
+    private var activeCount = 0
+    private var peakCount = 0
+    private var cancelledCount = 0
+
     func probe(durationOf url: URL) async -> AudioProbeResult {
-        let nanos = UInt64(perProbeSeconds * 1_000_000_000)
-        try? await Task.sleep(nanoseconds: nanos)
+        didStart()
+        do {
+            try await Task.sleep(nanoseconds: 30_000_000_000)
+        } catch is CancellationError {
+            didFinish(cancelled: true)
+            return .failed(reason: "cancelled at inventory deadline")
+        } catch {
+            didFinish(cancelled: false)
+            return .failed(reason: "unexpected probe error: \(error)")
+        }
+
+        didFinish(cancelled: false)
         return .decodable(durationSeconds: 0.5)
+    }
+
+    private func didStart() {
+        lock.lock(); defer { lock.unlock() }
+        startedCount += 1
+        activeCount += 1
+        peakCount = max(peakCount, activeCount)
+    }
+
+    private func didFinish(cancelled: Bool) {
+        lock.lock(); defer { lock.unlock() }
+        if cancelled { cancelledCount += 1 }
+        activeCount -= 1
+    }
+
+    var metrics: (started: Int, peakConcurrent: Int, cancelled: Int) {
+        lock.lock(); defer { lock.unlock() }
+        return (startedCount, peakCount, cancelledCount)
     }
 }
 

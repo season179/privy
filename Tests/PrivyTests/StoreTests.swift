@@ -393,7 +393,7 @@ private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespa
 
 // MARK: - Audio probe seam, locator, bounded process (findings 6 + 8)
 
-@Suite struct AudioProbeTests {
+@Suite(.serialized) struct AudioProbeTests {
 
     @Test func locateFFProbeHonorsEnvStrictlyWithoutFallthrough() throws {
         // An invalid PRIVY_FFPROBE_PATH yields unavailable with NO fallthrough to common paths.
@@ -482,6 +482,61 @@ private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespa
         #expect(lingerCount("sleep 30") == 0)
     }
 
+    @Test func hundredsOfFastProcessesReleaseDescriptorsImmediately() async throws {
+        // Warm Foundation/Process machinery before taking the baseline so one-time runtime
+        // descriptors are not mistaken for leaks.
+        for _ in 0..<12 {
+            let outcome = await BoundedProcess.run(
+                executable: "/usr/bin/true", arguments: [], timeout: .seconds(10)
+            )
+            guard case .success = outcome else {
+                Issue.record("warm-up process unexpectedly failed: \(outcome)")
+                return
+            }
+        }
+        let baseline = try openFileDescriptorCount()
+
+        for _ in 0..<300 {
+            let outcome = await BoundedProcess.run(
+                executable: "/usr/bin/true", arguments: [], timeout: .seconds(10)
+            )
+            guard case .success = outcome else {
+                Issue.record("fast process unexpectedly failed: \(outcome)")
+                return
+            }
+        }
+
+        let immediate = try openFileDescriptorCount()
+        if immediate > baseline + 24 {
+            Issue.record("fast natural exits retained descriptors: baseline \(baseline), immediate \(immediate)")
+            // The broken implementation releases its detached timeout arms after ten seconds.
+            // Wait only on the failing path so the red test leaves no descriptors behind.
+            try await Task.sleep(nanoseconds: 10_500_000_000)
+        }
+    }
+
+    @Test func cancellationTerminatesAndReapsSignalIgnoringChild() async throws {
+        let script = try makeSignalIgnoringScript()
+        defer { try? FileManager.default.removeItem(at: script) }
+        let startedAt = Date()
+        let task = Task {
+            await BoundedProcess.run(
+                executable: script.path, arguments: [], timeout: .seconds(10)
+            )
+        }
+        try await Task.sleep(nanoseconds: 200_000_000)
+        task.cancel()
+        let outcome = await task.value
+
+        if case .failure(let error) = outcome {
+            #expect(error == .timedOut)
+        } else {
+            Issue.record("expected cancellation to terminate the process, got \(outcome)")
+        }
+        #expect(Date().timeIntervalSince(startedAt) < 2.0)
+        #expect(lingerCount(script.lastPathComponent) == 0, "cancelled child must be reaped")
+    }
+
     @Test func signalIgnoringChildIsSigkillReapedWithinBound() async throws {
         // A child that IGNORES SIGTERM/SIGINT (a misbehaving ffprobe) must still be killed and
         // reaped within a bounded time: BoundedProcess escalates SIGTERM -> SIGINT -> SIGKILL,
@@ -523,6 +578,12 @@ private func trimmed(_ s: String) -> String { s.trimmingCharacters(in: .whitespa
         }
         #expect(abs(duration - 1.0) < 0.2)
     }
+}
+
+private func openFileDescriptorCount() throws -> Int {
+    // `/dev/fd` is the kernel's live descriptor view on macOS. Counting it avoids shelling
+    // out (which would add transient child descriptors) and is stable after Process warm-up.
+    try FileManager.default.contentsOfDirectory(atPath: "/dev/fd").count
 }
 
 private func makeSleeperScript(seconds: Int) throws -> URL {

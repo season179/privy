@@ -2,6 +2,12 @@ import Foundation
 import GRDB
 import CryptoKit
 
+/// The whole probe inventory gets one fixed window. This is deliberately longer than an
+/// individual production ffprobe timeout plus TERM→INT→SIGKILL grace, so a four-file or
+/// smaller inventory is normally classified by its per-process result rather than racing
+/// the inventory deadline. Larger inventories can never multiply this window by file count.
+private let DefaultInventoryProbeDeadline: Duration = .seconds(11)
+
 // `PrivyStore`: the SQLite-backed `PrivyStoring` actor. Wraps a GRDB `DatabasePool` in WAL
 // mode with foreign keys on, runs the versioned migrator, and implements the chunk/VAD/
 // health CRUD plus deterministic startup reconciliation.
@@ -31,6 +37,7 @@ public actor PrivyStore: PrivyStoring {
     private let dbPool: DatabasePool        // used only for migration
     private let db: any PrivyDBAccess        // read/write seam
     private let audioProbe: any AudioProbing // injectable probe seam
+    private let inventoryProbeDeadline: Duration
     private var prepared = false
 
     /// Creates the store and opens its `DatabasePool` (WAL, foreign keys on). The parent
@@ -44,6 +51,7 @@ public actor PrivyStore: PrivyStoring {
         self.dbPool = pool
         self.db = GRDBDBAccess(pool: pool)
         self.audioProbe = FFprobeAudioProbe()
+        self.inventoryProbeDeadline = DefaultInventoryProbeDeadline
     }
 
     /// Internal initializer exposing the audio-probe seam and an optional write-failure
@@ -53,7 +61,8 @@ public actor PrivyStore: PrivyStoring {
     internal init(
         databaseURL: URL,
         audioProbe: any AudioProbing,
-        writeFailureTrigger: PrivyWriteFailureTrigger? = nil
+        writeFailureTrigger: PrivyWriteFailureTrigger? = nil,
+        inventoryProbeDeadline: Duration = DefaultInventoryProbeDeadline
     ) throws {
         let parent = databaseURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
@@ -64,13 +73,20 @@ public actor PrivyStore: PrivyStoring {
         let base = GRDBDBAccess(pool: pool)
         self.db = writeFailureTrigger.map { GatedDBAccess(base, trigger: $0) } ?? base
         self.audioProbe = audioProbe
+        self.inventoryProbeDeadline = inventoryProbeDeadline
     }
 
     /// Direct-injection initializer (GRDB required). Kept for completeness.
-    internal init(dbPool: DatabasePool, db: any PrivyDBAccess, audioProbe: any AudioProbing) {
+    internal init(
+        dbPool: DatabasePool,
+        db: any PrivyDBAccess,
+        audioProbe: any AudioProbing,
+        inventoryProbeDeadline: Duration = DefaultInventoryProbeDeadline
+    ) {
         self.dbPool = dbPool
         self.db = db
         self.audioProbe = audioProbe
+        self.inventoryProbeDeadline = inventoryProbeDeadline
     }
 
     public func prepareDatabase() async throws {
@@ -375,11 +391,15 @@ public actor PrivyStore: PrivyStoring {
             let size = try fileSize(at: fileURL)
             pending.append(PendingAudioFile(url: fileURL, relativePath: relativePath, sizeBytes: size))
         }
-        // Probe candidate files with bounded concurrency so many slow/hung probes do not
-        // serialize into N × timeout of startup time (finding 2). The Store actor yields
-        // throughout via the async `AudioProbing` seam.
+        // Probe candidate files four-wide under one whole-inventory deadline. At that
+        // deadline every in-flight probe is cancelled/terminated and every unfinished or
+        // not-yet-started file remains a failed measurement, independent of file count.
         let toProbe = pending.filter { probePaths.contains($0.relativePath) }
-        let probeResults = await probeAudioFilesBounded(toProbe, using: audioProbe)
+        let probeResults = await probeAudioFilesBounded(
+            toProbe,
+            using: audioProbe,
+            deadline: inventoryProbeDeadline
+        )
         // Second pass (synchronous): assemble the inventory in enumeration order. Hashing
         // remains synchronous; it is local file I/O (no subprocess) and is fast relative to
         // an ffprobe spawn. A hash failure turns a "decodable" probe into a failed
@@ -962,30 +982,73 @@ private func classifyGuardedUpdate(
     }
 }
 
-/// Probes the given files with a bounded number of in-flight probes (default 4) so startup
-/// cost is `ceil(N/batch) × maxProbeTime`, not `N × maxProbeTime` (finding 2). The Store
-/// actor is yielded throughout via the async `AudioProbing` seam. Results are keyed by URL.
+private enum ProbeInventoryEvent: Sendable {
+    case result(URL, AudioProbeResult)
+    case deadline
+}
+
+/// Probes files dynamically at bounded concurrency while one deadline covers the entire
+/// inventory. Missing entries begin as failed measurements; only results completed before
+/// the deadline replace them. At the deadline the group is cancelled, which cancellation-
+/// aware probes (including `BoundedProcess`) turn into deterministic child termination/reap.
 private func probeAudioFilesBounded(
     _ files: [PendingAudioFile],
     using probe: any AudioProbing,
-    batchSize: Int = 4
+    deadline: Duration,
+    concurrencyLimit: Int = 4
 ) async -> [URL: AudioProbeResult] {
     guard !files.isEmpty else { return [:] }
-    var results: [URL: AudioProbeResult] = [:]
-    results.reserveCapacity(files.count)
-    var start = files.startIndex
-    while start < files.endIndex {
-        let end = Swift.min(start + batchSize, files.endIndex)
-        await withTaskGroup(of: (URL, AudioProbeResult).self) { group in
-            for file in files[start..<end] {
-                let p = probe
-                group.addTask { (file.url, await p.probe(durationOf: file.url)) }
-            }
-            for await (url, result) in group {
-                results[url] = result
+    var results = Dictionary(
+        uniqueKeysWithValues: files.map {
+            ($0.url, AudioProbeResult.failed(reason: "inventory probe deadline exceeded"))
+        }
+    )
+    let width = max(1, concurrencyLimit)
+
+    await withTaskGroup(of: ProbeInventoryEvent?.self) { group in
+        var nextIndex = files.startIndex
+        var completed = 0
+
+        func addProbe(_ file: PendingAudioFile) {
+            let p = probe
+            group.addTask {
+                let result = await p.probe(durationOf: file.url)
+                guard !Task.isCancelled else { return nil }
+                return .result(file.url, result)
             }
         }
-        start = end
+
+        for _ in 0..<Swift.min(width, files.count) {
+            addProbe(files[nextIndex])
+            nextIndex += 1
+        }
+        group.addTask {
+            do {
+                try await Task.sleep(for: deadline)
+                return .deadline
+            } catch {
+                return nil
+            }
+        }
+
+        while let event = await group.next() {
+            guard let event else { continue }
+            switch event {
+            case .result(let url, let result):
+                results[url] = result
+                completed += 1
+                if nextIndex < files.endIndex {
+                    addProbe(files[nextIndex])
+                    nextIndex += 1
+                } else if completed == files.count {
+                    group.cancelAll() // release the deadline arm immediately
+                    return
+                }
+            case .deadline:
+                group.cancelAll()
+                return
+            }
+        }
     }
     return results
 }
