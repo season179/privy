@@ -1,17 +1,18 @@
 import Testing
 import Foundation
+import AppKit
+import CoreAudio
 @testable import PrivyCore
 
 // W1 acceptance tests: contracts support fakes, the clock behaves under normal/sleep/jump
-// and cross-epoch conditions, and monitors emit/coalesce events without AppKit UI or
-// CoreAudio hardware. See docs/m1/plan.md ("W1 — Acceptance criteria").
+// and cross-epoch conditions, and monitors emit/coalesce events. The monitor tests drive
+// the REAL lifecycle (start, raw callback path, UID enrichment, stop removal, post-stop
+// silence, registration-failure rollback) through injected notification/CoreAudio adapters,
+// with no AppKit UI or CoreAudio hardware. See docs/m1/plan.md ("W1 — Acceptance criteria").
 
 // MARK: - Test doubles
 
 /// Lock-protected fake clock injected from the test target (per the plan's discipline).
-/// A class so the same instance can be shared across the test thread and the monitor
-/// task; `@unchecked Sendable` is the test-side lock wrapper (production clocks are
-/// genuine Sendable values).
 final class TestClock: PrivyClock, @unchecked Sendable {
     private let epoch: UUID
     private let lock = NSLock()
@@ -43,7 +44,7 @@ final class TestClock: PrivyClock, @unchecked Sendable {
     }
 
     /// Sleep-like passage: identical to `advance`, because `ContinuousClock` keeps
-    /// counting across system sleep. Used to model a lid-close interval.
+    /// counting across system sleep.
     @discardableResult
     func advanceLikeSleep(seconds: Double) -> Self { advance(seconds: seconds) }
 
@@ -80,10 +81,121 @@ final class EventCollector: @unchecked Sendable {
 
 private extension [MonitorEvent] {
     var deviceListCount: Int { filter { if case .deviceListChanged = $0 { return true }; return false }.count }
-    var defaultInputUIDs: [String?] { compactMap { event -> String? in
-        if case .defaultInputChanged(_, let uid) = event { return uid }
-        return nil
-    } }
+}
+
+// MARK: - Fake registrars / adapters for monitor lifecycle tests
+
+/// Captures sleep/wake handlers and posts synthetic notifications, so `SleepWakeMonitor`
+/// lifecycle (registration, order/timestamps, removal, idempotence, post-stop silence) is
+/// testable without AppKit UI.
+actor FakeSleepWakeRegistrar: SleepWakeRegistrar {
+    private var sleep: (@Sendable (Notification) -> Void)?
+    private var wake: (@Sendable (Notification) -> Void)?
+    private(set) var registerCount = 0
+    private(set) var unregisterCount = 0
+
+    func register(
+        sleep: @Sendable @escaping (Notification) -> Void,
+        wake: @Sendable @escaping (Notification) -> Void
+    ) async {
+        registerCount += 1
+        self.sleep = sleep
+        self.wake = wake
+    }
+
+    func unregister() async {
+        unregisterCount += 1
+        self.sleep = nil
+        self.wake = nil
+    }
+
+    func postSleep() async { sleep?(Notification(name: NSWorkspace.willSleepNotification)) }
+    func postWake() async { wake?(Notification(name: NSWorkspace.didWakeNotification)) }
+}
+
+/// Captures CoreAudio property-listener registrations so tests can drive the real raw
+/// callback path (the `@convention(c)` procs) through the monitor, query/resolve a fake
+/// device UID, and simulate `addPropertyListener` failures to exercise rollback.
+final class FakeAudioHardwareAdapter: AudioHardwareAdapter, @unchecked Sendable {
+    private struct Captured {
+        let object: AudioObjectID
+        let property: AudioObjectPropertyAddress
+        let proc: AudioObjectPropertyListenerProc
+        let clientData: UnsafeMutableRawPointer?
+    }
+
+    private let lock = NSLock()
+    private var captured: [Captured] = []
+    private var failOnAdd: Set<Int> = []
+    private var addIndex = 0
+    private var removeCount = 0
+    private var uid: String?
+
+    func setFailOnAdd(at index: Int) {
+        lock.lock(); defer { lock.unlock() }
+        failOnAdd.insert(index)
+    }
+    func setDefaultInputUID(_ uid: String?) {
+        lock.lock(); defer { lock.unlock() }
+        self.uid = uid
+    }
+    var removeCountSnapshot: Int { lock.lock(); defer { lock.unlock() }; return removeCount }
+    var capturedCount: Int { lock.lock(); defer { lock.unlock() }; return captured.count }
+
+    func addPropertyListener(
+        object: AudioObjectID,
+        property: AudioObjectPropertyAddress,
+        listener: AudioObjectPropertyListenerProc,
+        clientData: UnsafeMutableRawPointer?
+    ) -> OSStatus {
+        lock.lock(); defer { lock.unlock() }
+        if failOnAdd.contains(addIndex) {
+            addIndex += 1
+            return -1
+        }
+        captured.append(Captured(object: object, property: property, proc: listener, clientData: clientData))
+        addIndex += 1
+        return noErr
+    }
+
+    func removePropertyListener(
+        object: AudioObjectID,
+        property: AudioObjectPropertyAddress,
+        listener: AudioObjectPropertyListenerProc,
+        clientData: UnsafeMutableRawPointer?
+    ) -> OSStatus {
+        lock.lock(); defer { lock.unlock() }
+        removeCount += 1
+        // Identify the listener by object + property selector (the proc is a function
+        // pointer and not needed to disambiguate the two registrations).
+        captured.removeAll { $0.object == object && $0.property.mSelector == property.mSelector }
+        return noErr
+    }
+
+    func currentDefaultInputDeviceUID() -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return uid
+    }
+
+    // MARK: raw callback simulation (invokes the captured @convention(c) proc)
+
+    func simulateDeviceListChanged() {
+        invoke(selector: kAudioHardwarePropertyDevices)
+    }
+    func simulateDefaultInputChanged() {
+        invoke(selector: kAudioHardwarePropertyDefaultInputDevice)
+    }
+
+    private func invoke(selector: AudioObjectPropertySelector) {
+        lock.lock()
+        let entry = captured.first { $0.property.mSelector == selector }
+        lock.unlock()
+        guard let entry else { return }
+        var address = entry.property
+        withUnsafePointer(to: &address) { ptr in
+            _ = entry.proc(entry.object, 1, ptr, entry.clientData)
+        }
+    }
 }
 
 // MARK: - SystemClock + PrivyClock
@@ -93,7 +205,6 @@ private extension [MonitorEvent] {
     @Test func systemClockProducesIncreasingMonotonicReadingsInOneEpoch() {
         let clock = SystemClock()
         let a = clock.now()
-        // A small real-time nudge so the two readings are not necessarily identical.
         Thread.sleep(forTimeInterval: 0.001)
         let b = clock.now()
         #expect(a.clockEpoch == b.clockEpoch)
@@ -106,7 +217,6 @@ private extension [MonitorEvent] {
         let a = clock.now()
         Thread.sleep(forTimeInterval: 0.02)
         let b = clock.now()
-        // Wall delta and monotonic delta should agree within the discontinuity threshold.
         let wallDelta = b.wallUTC.timeIntervalSince(a.wallUTC)
         let monoDelta = clock.elapsedSeconds(from: a, to: b)
         #expect(monoDelta > 0)
@@ -125,9 +235,6 @@ private extension [MonitorEvent] {
     }
 
     @Test func fakeClockSleepLikeAdvanceCountsAsDuration() {
-        // ContinuousClock advances across sleep: a 2-minute sleep contributes 120s to
-        // the monotonic timeline, so it is represented as elapsed time (not a gap to be
-        // discovered by the watchdog — the engine is independently stopped during sleep).
         let clock = TestClock()
         let before = clock.now()
         clock.advanceLikeSleep(seconds: 120)
@@ -137,14 +244,12 @@ private extension [MonitorEvent] {
     }
 
     @Test func fakeClockWallJumpDoesNotAffectMonotonicDuration() {
-        // NTP/DST/manual wall jump must not corrupt durations: derive from monotonic only.
         let clock = TestClock()
         let a = clock.now()
         clock.advance(seconds: 3)
-        clock.jumpWall(by: 3600) // wall jumps an hour
+        clock.jumpWall(by: 3600)
         let b = clock.now()
         #expect(clock.elapsedSeconds(from: a, to: b) == 3)
-        // The wall delta reflects the jump; the monotonic delta does not.
         #expect(b.wallUTC.timeIntervalSince(a.wallUTC) == 3 + 3600)
         #expect(b.monotonicSeconds - a.monotonicSeconds == 3)
     }
@@ -155,7 +260,6 @@ private extension [MonitorEvent] {
         let a = clockA.now()
         clockB.advance(seconds: 10)
         let b = clockB.now()
-        // Different epochs: refused (zero), never the naive 10.
         #expect(clockA.elapsedSeconds(from: a, to: b) == 0)
         #expect(a.clockEpoch != b.clockEpoch)
     }
@@ -165,7 +269,6 @@ private extension [MonitorEvent] {
         let a = clock.now()
         clock.advance(seconds: 7)
         let b = clock.now()
-        // Same epoch as each other (and as the producing clock) subtracts fine.
         #expect(clock.elapsedSeconds(from: a, to: b) == 7)
     }
 
@@ -174,11 +277,8 @@ private extension [MonitorEvent] {
     @Test func discontinuityDetectsForwardWallJump() {
         let epoch = UUID()
         let detector = ClockDiscontinuityDetector()
-        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000),
-                                monotonicSeconds: 0, clockEpoch: epoch)
-        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1360),
-                              monotonicSeconds: 10, clockEpoch: epoch)
-        // wall delta 360 − mono delta 10 = +350s drift → discontinuity.
+        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000), monotonicSeconds: 0, clockEpoch: epoch)
+        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1360), monotonicSeconds: 10, clockEpoch: epoch)
         let drift = detector.drift(from: from, to: to)
         #expect(drift != nil)
         #expect((drift ?? 0) > 1)
@@ -187,49 +287,37 @@ private extension [MonitorEvent] {
     @Test func discontinuityDetectsBackwardWallJump() {
         let epoch = UUID()
         let detector = ClockDiscontinuityDetector()
-        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 2000),
-                                monotonicSeconds: 0, clockEpoch: epoch)
-        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1540), // DST rollback
-                              monotonicSeconds: 60, clockEpoch: epoch)
+        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 2000), monotonicSeconds: 0, clockEpoch: epoch)
+        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1540), monotonicSeconds: 60, clockEpoch: epoch)
         let drift = detector.drift(from: from, to: to)
         #expect(drift != nil)
-        #expect((drift ?? 0) < 0) // negative drift for a backward jump
+        #expect((drift ?? 0) < 0)
     }
 
     @Test func discontinuityWithinThresholdIsNil() {
         let epoch = UUID()
         let detector = ClockDiscontinuityDetector()
-        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000),
-                                monotonicSeconds: 0, clockEpoch: epoch)
-        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1010.4),
-                              monotonicSeconds: 10, clockEpoch: epoch)
-        // drift 0.4s < 1s threshold → not a discontinuity.
+        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000), monotonicSeconds: 0, clockEpoch: epoch)
+        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1010.4), monotonicSeconds: 10, clockEpoch: epoch)
         #expect(detector.drift(from: from, to: to) == nil)
     }
 
     @Test func discontinuityThresholdIsConfigurable() {
         let epoch = UUID()
         let detector = ClockDiscontinuityDetector(threshold: 0.1)
-        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000),
-                                monotonicSeconds: 0, clockEpoch: epoch)
-        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1010.4),
-                              monotonicSeconds: 10, clockEpoch: epoch)
-        // Same 0.4s drift now exceeds the tighter threshold.
+        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000), monotonicSeconds: 0, clockEpoch: epoch)
+        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 1010.4), monotonicSeconds: 10, clockEpoch: epoch)
         #expect(detector.drift(from: from, to: to) != nil)
     }
 
     @Test func discontinuityCrossEpochReturnsNil() {
         let detector = ClockDiscontinuityDetector()
-        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000),
-                                monotonicSeconds: 0, clockEpoch: UUID())
-        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 9000),
-                              monotonicSeconds: 0, clockEpoch: UUID())
-        // An epoch change is represented by a separate startup/recovery health event,
-        // not by a clock discontinuity.
+        let from = ClockReading(wallUTC: Date(timeIntervalSince1970: 1000), monotonicSeconds: 0, clockEpoch: UUID())
+        let to = ClockReading(wallUTC: Date(timeIntervalSince1970: 9000), monotonicSeconds: 0, clockEpoch: UUID())
         #expect(detector.drift(from: from, to: to) == nil)
     }
 
-    // MARK: MonitorEventStream ordering + teardown
+    // MARK: MonitorEventStream ordering, teardown, and no-silent-discard
 
     @Test func monitorEventStreamPreservesEmissionOrder() async {
         let clock = TestClock()
@@ -243,8 +331,7 @@ private extension [MonitorEvent] {
         clock.advance(seconds: 1)
         stream.emitDeviceListChanged()
 
-        // Let the consumer task drain before terminating the stream.
-        try? await Task.sleep(for: .milliseconds(50))
+        try? await Task.sleep(for: .milliseconds(30))
         stream.finish()
         _ = await task.value
 
@@ -263,7 +350,7 @@ private extension [MonitorEvent] {
 
         stream.emitDeviceListChanged()
         stream.finish()
-        _ = await task.value // exits because the stream terminated
+        _ = await task.value
 
         #expect(collector.snapshot().count == 1)
     }
@@ -272,33 +359,87 @@ private extension [MonitorEvent] {
         let clock = TestClock()
         let stream = MonitorEventStream(clock: clock)
         stream.finish()
-        stream.finish() // must not crash
-        // Emitting after finish is a no-op.
+        stream.finish()
         stream.emitDeviceListChanged()
     }
 
-    // MARK: AudioDeviceMonitor coalescing + ordering (no CoreAudio/AppKit)
+    @Test func monitorEventStreamIsUnboundedAndLossless() async {
+        // W1's no-silent-discard constraint: the default unbounded policy must never evict
+        // a sleep/wake/device event, however many pile up before the consumer drains them.
+        let clock = TestClock()
+        let stream = MonitorEventStream(clock: clock)
+        let collector = EventCollector()
+        let task = Task { for await event in stream.stream { collector.append(event) } }
+
+        let n = 1000
+        for _ in 0..<n { stream.emitDeviceListChanged() }
+        try? await Task.sleep(for: .milliseconds(100))
+        stream.finish()
+        _ = await task.value
+
+        #expect(collector.snapshot().count == n)
+    }
+
+    // MARK: SleepWakeMonitor lifecycle (no AppKit UI)
+
+    @Test func sleepWakeMonitorRegistersEmitsInOrderAndRemoves() async throws {
+        let clock = TestClock()
+        let registrar = FakeSleepWakeRegistrar()
+        let monitor = SleepWakeMonitor(clock: clock, registrar: registrar)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        try await monitor.start()
+        #expect(await registrar.registerCount == 1)
+        // Idempotent start: a second start must not re-register.
+        try await monitor.start()
+        #expect(await registrar.registerCount == 1)
+
+        clock.advance(seconds: 5)
+        await registrar.postSleep()
+        clock.advance(seconds: 3)
+        await registrar.postWake()
+
+        try? await Task.sleep(for: .milliseconds(30))
+        await monitor.stop()
+        #expect(await registrar.unregisterCount == 1)
+        _ = await task.value
+
+        let events = collector.snapshot()
+        #expect(events.count == 2)
+        guard case .willSleep(let r1) = events[0] else { Issue.record("expected willSleep first"); return }
+        guard case .didWake(let r2) = events[1] else { Issue.record("expected didWake second"); return }
+        #expect(r2.monotonicSeconds > r1.monotonicSeconds)
+    }
+
+    @Test func sleepWakeMonitorIsSilentAfterStop() async throws {
+        let clock = TestClock()
+        let registrar = FakeSleepWakeRegistrar()
+        let monitor = SleepWakeMonitor(clock: clock, registrar: registrar)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        try await monitor.start()
+        await monitor.stop()
+        // Handlers are unregistered; posting must produce no event.
+        await registrar.postSleep()
+        await registrar.postWake()
+        try? await Task.sleep(for: .milliseconds(30))
+        _ = await task.value
+
+        #expect(collector.snapshot().isEmpty)
+    }
+
+    // MARK: AudioDeviceMonitor coalescing + ordering
 
     @Test func audioDeviceMonitorDefaultDebounceIs500ms() {
         #expect(AudioDeviceMonitor.defaultDebounceWindow == .milliseconds(500))
     }
 
-    @Test func audioDeviceMonitorCoalescesSingleKindBurstViaFlush() async {
-        let clock = TestClock()
-        let monitor = AudioDeviceMonitor(clock: clock)
-        let collector = EventCollector()
-        let task = Task { for await event in monitor.events { collector.append(event) } }
-
-        for _ in 0..<6 { await monitor.injectDeviceListChanged() }
-        await monitor.stop() // flushNow emits the one coalesced event, then finishes
-        _ = await task.value
-
-        let events = collector.snapshot()
-        #expect(events.count == 1)
-        #expect(events.deviceListCount == 1)
-    }
-
-    @Test func audioDeviceMonitorCoalescesMixedBurstInOrder() async {
+    @Test func audioDeviceMonitorEmitsOneEventPerWindowPreferringDefaultInput() async {
+        // Orchestrator decision: exactly one event per window. When both default-input and
+        // device-list changed, prefer .defaultInputChanged(latestUID); otherwise
+        // .deviceListChanged.
         let clock = TestClock()
         let monitor = AudioDeviceMonitor(clock: clock)
         let collector = EventCollector()
@@ -308,57 +449,163 @@ private extension [MonitorEvent] {
         await monitor.injectDeviceListChanged()
         await monitor.injectDeviceListChanged()
         await monitor.injectDefaultInputChanged(deviceUID: "devB")
+        await monitor.stop() // flushNow emits exactly one coalesced event
+        _ = await task.value
+
+        let events = collector.snapshot()
+        #expect(events.count == 1)
+        guard case .defaultInputChanged(_, let uid) = events[0] else {
+            Issue.record("expected a single defaultInputChanged carrying the latest UID"); return
+        }
+        #expect(uid == "devB")
+    }
+
+    @Test func audioDeviceMonitorEmitsDeviceListWhenNoDefaultInputSignal() async {
+        let clock = TestClock()
+        let monitor = AudioDeviceMonitor(clock: clock)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        for _ in 0..<6 { await monitor.injectDeviceListChanged() }
         await monitor.stop()
         _ = await task.value
 
         let events = collector.snapshot()
-        // One defaultInputChanged (latest UID wins) + one deviceListChanged, in that order.
-        #expect(events.count == 2)
-        #expect(events.defaultInputUIDs == ["devB"])
+        #expect(events.count == 1)
         #expect(events.deviceListCount == 1)
-        guard case .defaultInputChanged = events.first else {
-            Issue.record("expected defaultInputChanged to be emitted first"); return
-        }
-        guard case .deviceListChanged = events.last else {
-            Issue.record("expected deviceListChanged to be emitted second"); return
-        }
     }
 
     @Test func audioDeviceMonitorTrailingDebounceFiresOnceAfterWindow() async {
-        // Proves the timer-driven trailing debounce (not just flushNow) collapses a burst.
-        // Uses a small window so the test is fast; the production default is asserted above.
         let clock = TestClock()
         let monitor = AudioDeviceMonitor(clock: clock, debounceWindow: .milliseconds(60))
         let collector = EventCollector()
         let task = Task { for await event in monitor.events { collector.append(event) } }
 
         for _ in 0..<5 { await monitor.injectDeviceListChanged() }
-        // Wait well past the 60ms window so the trailing flush has fired.
         try? await Task.sleep(for: .milliseconds(300))
-
-        let deviceListCount = collector.snapshot().deviceListCount
-        #expect(deviceListCount == 1)
+        #expect(collector.snapshot().deviceListCount == 1)
 
         await monitor.stop()
         _ = await task.value
     }
 
     @Test func audioDeviceMonitorSeparateBurstsEmitSeparately() async {
-        // Two bursts separated by more than the window produce two coalesced events.
         let clock = TestClock()
         let monitor = AudioDeviceMonitor(clock: clock, debounceWindow: .milliseconds(60))
         let collector = EventCollector()
         let task = Task { for await event in monitor.events { collector.append(event) } }
 
         await monitor.injectDeviceListChanged()
-        try? await Task.sleep(for: .milliseconds(200)) // burst 1 flushes
+        try? await Task.sleep(for: .milliseconds(200))
         await monitor.injectDeviceListChanged()
         await monitor.injectDeviceListChanged()
-        try? await Task.sleep(for: .milliseconds(200)) // burst 2 flushes
-
+        try? await Task.sleep(for: .milliseconds(200))
         #expect(collector.snapshot().deviceListCount == 2)
 
         await monitor.stop()
         _ = await task.value
+    }
+
+    // MARK: AudioDeviceMonitor real lifecycle (injected CoreAudio adapter)
+
+    @Test func audioDeviceMonitorLifecycleDeliversRawDeviceListSignal() async throws {
+        let clock = TestClock()
+        let adapter = FakeAudioHardwareAdapter()
+        let monitor = AudioDeviceMonitor(clock: clock, debounceWindow: .milliseconds(60), adapter: adapter)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        try await monitor.start()
+        #expect(adapter.capturedCount == 2) // devices + defaultInput registered
+
+        // Drive the captured @convention(c) proc through the raw path: proc -> rawEmitter
+        // -> forwarder -> debouncer -> publishedEmitter.
+        adapter.simulateDeviceListChanged()
+        adapter.simulateDeviceListChanged()
+        try? await Task.sleep(for: .milliseconds(250)) // forward + 60ms debounce + emit
+
+        #expect(collector.snapshot().deviceListCount == 1)
+
+        await monitor.stop()
+        #expect(adapter.removeCountSnapshot == 2)
+        _ = await task.value
+    }
+
+    @Test func audioDeviceMonitorEnrichesDefaultInputWithUID() async throws {
+        let clock = TestClock()
+        let adapter = FakeAudioHardwareAdapter()
+        adapter.setDefaultInputUID("BuiltInMic-42")
+        let monitor = AudioDeviceMonitor(clock: clock, debounceWindow: .milliseconds(60), adapter: adapter)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        try await monitor.start()
+        adapter.simulateDefaultInputChanged()
+        try? await Task.sleep(for: .milliseconds(250))
+
+        let events = collector.snapshot()
+        #expect(events.count == 1)
+        guard case .defaultInputChanged(_, let uid) = events[0] else {
+            Issue.record("expected defaultInputChanged"); return
+        }
+        #expect(uid == "BuiltInMic-42")
+
+        await monitor.stop()
+        _ = await task.value
+    }
+
+    @Test func audioDeviceMonitorIsSilentAfterStop() async throws {
+        let clock = TestClock()
+        let adapter = FakeAudioHardwareAdapter()
+        let monitor = AudioDeviceMonitor(clock: clock, adapter: adapter)
+        let collector = EventCollector()
+        let task = Task { for await event in monitor.events { collector.append(event) } }
+
+        try await monitor.start()
+        adapter.simulateDeviceListChanged()
+        await monitor.stop()
+
+        let before = collector.snapshot().count
+        // No listener remains (captured procs removed) and the published stream is
+        // finished, so simulating after stop must produce no new event.
+        adapter.simulateDeviceListChanged()
+        adapter.simulateDefaultInputChanged()
+        try? await Task.sleep(for: .milliseconds(30))
+        _ = await task.value
+
+        #expect(collector.snapshot().count == before)
+    }
+
+    @Test func audioDeviceMonitorRollsBackOnFirstListenerFailure() async throws {
+        let clock = TestClock()
+        let adapter = FakeAudioHardwareAdapter()
+        adapter.setFailOnAdd(at: 0) // the devices listener fails
+        let monitor = AudioDeviceMonitor(clock: clock, adapter: adapter)
+
+        do {
+            try await monitor.start()
+            Issue.record("start should have thrown when the first listener fails")
+        } catch {
+            // expected
+        }
+        #expect(adapter.capturedCount == 0)     // nothing installed
+        #expect(adapter.removeCountSnapshot == 0) // nothing to roll back
+    }
+
+    @Test func audioDeviceMonitorRollsBackOnSecondListenerFailure() async throws {
+        let clock = TestClock()
+        let adapter = FakeAudioHardwareAdapter()
+        adapter.setFailOnAdd(at: 1) // devices installs; defaultInput fails
+        let monitor = AudioDeviceMonitor(clock: clock, adapter: adapter)
+
+        do {
+            try await monitor.start()
+            Issue.record("start should have thrown when the second listener fails")
+        } catch {
+            // expected
+        }
+        // The successfully-installed devices listener must have been removed on rollback.
+        #expect(adapter.capturedCount == 0)
+        #expect(adapter.removeCountSnapshot == 1)
     }
 }
