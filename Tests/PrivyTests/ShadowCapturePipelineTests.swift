@@ -437,6 +437,93 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         await fixture.pipeline.shutdown()
     }
 
+    @Test func recoveredTerminalEpisodeAllowsPauseAndHandlesSecondWriterFailure() async throws {
+        let fixture = try makePipelineFixture()
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+
+        let firstEpoch = UUID()
+        let firstReading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: firstReading,
+            captureEpoch: firstEpoch
+        ))
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+
+        let firstFailureAt = fixture.clock.now()
+        await fixture.capture.emit(.engineStopped(firstFailureAt, reason: .fatalError))
+        #expect(await waitUntil {
+            if case .error = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+
+        await fixture.pipeline.handle(.defaultInputChanged(fixture.clock.now(), deviceUID: "recovered-device"))
+        try await Task.sleep(for: .milliseconds(650))
+        let recoveredReading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: recoveredReading,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+
+        await fixture.pipeline.pause(untilUTC: nil)
+        #expect(await waitUntil {
+            if case .paused(untilUTC: nil) = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+        await fixture.pipeline.resume()
+        let resumedReading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        let resumedEpoch = UUID()
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: resumedReading,
+            captureEpoch: resumedEpoch
+        ))
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+
+        await fixture.store.setFailure(.checkpoint)
+        let now = fixture.clock.now()
+        let fiveSecondsEarlier = ClockReading(
+            wallUTC: now.wallUTC.addingTimeInterval(-5),
+            monotonicSeconds: now.monotonicSeconds - 5,
+            clockEpoch: now.clockEpoch
+        )
+        await fixture.capture.emit(pipelineBlock(
+            count: privySampleRate * 5,
+            start: 1_600,
+            sequence: 1,
+            reading: fiveSecondsEarlier,
+            captureEpoch: resumedEpoch
+        ))
+
+        #expect(await waitUntil {
+            if case .error = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+        #expect((await fixture.capture.stops).filter { $0 == .fatalError }.count >= 2)
+        #expect((await fixture.store.allHealth()).contains { $0.kind == .writerError })
+        let chunks = await fixture.store.allChunks()
+        #expect(!chunks.contains { $0.state == .recording })
+        await fixture.pipeline.shutdown()
+    }
+
     @Test func heartbeatFaultInvokesFatalWriterCloseWiring() async throws {
         let writer = CloseReasonSpyWriter()
         let fixture = try makePipelineFixture(writerBuilder: { _, _ in writer })
@@ -477,7 +564,10 @@ private func cleanUp(_ fixture: PipelineFixture) async {
             reading: first,
             captureEpoch: epoch
         ))
-        #expect(await waitUntil { (await fixture.store.allChunks()).first?.state == .recording })
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
 
         let at = fixture.clock.now()
         await fixture.capture.emit(.queueOverrun(at, droppedSourceFrames: 4_800, durationSeconds: 0.1))
@@ -492,8 +582,9 @@ private func cleanUp(_ fixture: PipelineFixture) async {
             reading: afterGap,
             captureEpoch: epoch
         ))
+        let expectedLastAudio = afterGap.wallUTC.addingTimeInterval(0.1)
         #expect(await waitUntil {
-            (await fixture.store.allHealth()).filter { $0.kind == .recordingStarted }.count >= 1
+            await fixture.snapshots.latest()?.lastAudioAtUTC == expectedLastAudio
         })
 
         await fixture.pipeline.handle(.deviceListChanged(at))
@@ -507,6 +598,54 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         #expect(health.filter { $0.kind == .deviceChange }.count == 1)
         #expect(health.first { $0.kind == .engineRestart && $0.detail.message.contains("device") }?.detail.deviceUID == "airpods")
         #expect((await fixture.capture.restarts).filter { $0 == .deviceChange }.count == 1)
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func overrunSuppressesOnlyAccountedPortionOfLargerFollowingGap() async throws {
+        let fixture = try makePipelineFixture()
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        let epoch = UUID()
+        let first = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: first,
+            captureEpoch: epoch
+        ))
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+
+        let overrunAt = fixture.clock.now()
+        await fixture.capture.emit(.queueOverrun(
+            overrunAt,
+            droppedSourceFrames: 4_800,
+            durationSeconds: 0.1
+        ))
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).contains { $0.kind == .queueOverrun }
+        })
+
+        let resumedAt = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 4_800,
+            sequence: 2,
+            reading: resumedAt,
+            captureEpoch: epoch
+        ))
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).filter { $0.kind == .gap }.count == 2
+        })
+
+        let gaps = await fixture.store.allHealth().filter { $0.kind == .gap }
+        #expect(gaps.count == 2)
+        #expect(abs(gaps.reduce(0.0) { $0 + ($1.detail.durationSeconds ?? 0) } - 0.2) < 0.000_001)
+        #expect(gaps.contains { $0.detail.message.contains("unaccounted") })
+        #expect((await fixture.store.allHealth()).filter { $0.kind == .vadGap }.count == 2)
         await fixture.pipeline.shutdown()
     }
 
