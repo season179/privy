@@ -18,8 +18,10 @@ import os.lock
 ///   `os_unfair_lock_lock`/`os_unfair_lock_unlock`. The instance is never copied.
 /// - `stream` and `clock` are immutable `let`s published at init; both are `Sendable`.
 public final class MonitorEventStream: @unchecked Sendable {
-    /// The bounded stream consumed by the pipeline. Newest events displace oldest when the
-    /// consumer lags, so a stalled pipeline never blocks a notification callback.
+    /// The stream consumed by the pipeline. Unbounded by default: monitor events are
+    /// low-volume and W1's no-silent-discard constraint forbids evicting a sleep/wake or
+    /// device-change event without telemetry. A buffering policy remains injectable for
+    /// tests that want to exercise a specific bound.
     public let stream: AsyncStream<MonitorEvent>
 
     private let clock: any PrivyClock
@@ -28,7 +30,7 @@ public final class MonitorEventStream: @unchecked Sendable {
 
     public init(
         clock: any PrivyClock,
-        bufferingPolicy: AsyncStream<MonitorEvent>.Continuation.BufferingPolicy = .bufferingNewest(256)
+        bufferingPolicy: AsyncStream<MonitorEvent>.Continuation.BufferingPolicy = .unbounded
     ) {
         self.clock = clock
         var captured: AsyncStream<MonitorEvent>.Continuation!
