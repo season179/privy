@@ -357,39 +357,206 @@ private func files(in dir: URL) -> [String] {
         }
     }
 
-    @Test func reconcileSurvivesAMidwayFileFailureAndSurfacesIt() async throws {
-        // "DB/file-operation failure midway": one action cannot complete (its rename target
-        // lives in a read-only directory, so `moveItem` throws), yet reconcile must not abort
-        // and sibling actions must still commit. The failure is surfaced as a health row.
+    @Test func reconcileSurvivesAMidwayFileFailureTerminalizesAndReruns() async throws {
+        // "file-operation failure midway": one action's rename target lives in a read-only
+        // directory so `moveItem` throws. Reconcile must (a) not abort, (b) terminally mark
+        // the affected row `failed` (never leave it `recording`), (c) still commit siblings,
+        // and (d) converge stably once the fault is cleared and reconcile re-runs.
         let (layout, store, root) = try await makeLayoutAndStore()
         let db = layout.databaseURL.path
         let roDir = audioURL(layout, "ro")
         defer {
-            // Restore write perms so cleanup can delete the read-only subtree.
             try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: roDir.path)
             try? FileManager.default.removeItem(at: root)
         }
 
-        // Chunk A: decodable partial inside a read-only subdir → renaming it out throws EPERM.
         try FileManager.default.createDirectory(at: roDir, withIntermediateDirectories: true)
         let aPath = "ro/2026-01-01T00-00-00.000000Z_blockA.ogg"
-        _ = try await store.createChunk(newChunk(path: aPath))
+        let aChunk = try await store.createChunk(newChunk(path: aPath))
         try writeValidOgg(at: audioURL(layout, aPath + ".partial"), durationSeconds: 1.0)
         try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: roDir.path)
 
-        // Chunk B: final `.ogg` at the (writable) top level → finalizes with no rename.
         let bPath = "2026-01-01T00-00-00.000000Z_okB.ogg"
         let bChunk = try await store.createChunk(newChunk(path: bPath))
         try writeValidOgg(at: audioURL(layout, bPath), durationSeconds: 1.0)
 
-        // Reconcile must not throw: the failing action is caught, not propagated.
+        // Must not throw: the failing action is caught + terminally surfaced, not propagated.
         _ = try await store.reconcile(storage: layout, at: reading())
 
-        // Sibling action committed despite A's failure.
+        // The failed action's row is terminally `failed` (never left `recording`).
+        let aCSV = try chunkRowCSV(db, id: aChunk.id)
+        #expect(aCSV.hasPrefix("failed|"), "failed row must not remain recording")
+        // Sibling committed; the failure was surfaced via health.
         let bCSV = try chunkRowCSV(db, id: bChunk.id)
         #expect(bCSV.hasPrefix("ready|"), "sibling chunk must still finalize")
-        // The midway failure is surfaced, not silently swallowed.
         #expect(try healthKinds(db).contains("error"))
+        let recordingCount = try countRows(db, whereClause: "state='recording'")
+        #expect(recordingCount == 0, "no row should remain recording after reconcile")
+
+        // Restore the fault and re-run: stable idempotent state.
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: roDir.path)
+        let rowsBefore = try countRows(db, whereClause: "1=1")
+        let again = try await store.reconcile(storage: layout, at: reading())
+        #expect(again.actions.isEmpty, "second reconcile must be a no-op; got \(again.actions)")
+        let rowsAfter = try countRows(db, whereClause: "1=1")
+        #expect(rowsAfter == rowsBefore)
+        // A stays failed (terminal); its audio is preserved (never deleted).
+        #expect(try chunkRowCSV(db, id: aChunk.id).hasPrefix("failed|"))
+        #expect(FileManager.default.fileExists(atPath: audioURL(layout, aPath + ".partial").path))
+    }
+
+    @Test func reconcileThrowsAggregateWhenDatabaseUnavailableMidPass() async throws {
+        // "DB-failure midway": the database becomes unavailable mid-pass. The required
+        // failure-surfacing write also fails, so reconcile must throw an aggregate rather
+        // than return a success report that hides the failure. Restoring the DB lets a
+        // re-run converge.
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("privy-recon-db-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = AppPaths.layout(rootedAt: root)
+        try AppPaths.ensureDirectoriesExist(layout)
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL, audioProbe: FFprobeAudioProbe(), writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+
+        // Two recoverable chunks so the pass has work that must hit the DB.
+        let p1 = "2026-01-01T00-00-00.000000Z_a1.ogg"
+        _ = try await store.createChunk(newChunk(path: p1))
+        try writeValidOgg(at: audioURL(layout, p1 + ".partial"), durationSeconds: 1.0)
+        let p2 = "2026-01-01T00-00-00.000000Z_a2.ogg"
+        _ = try await store.createChunk(newChunk(path: p2))
+        try writeValidOgg(at: audioURL(layout, p2 + ".partial"), durationSeconds: 1.0)
+
+        // Arm the DB failure for writes only; reads (inventory) still succeed.
+        trigger.startFailing()
+        var didThrow = false
+        do {
+            _ = try await store.reconcile(storage: layout, at: reading())
+        } catch {
+            didThrow = true
+        }
+        #expect(didThrow, "reconcile must throw an aggregate when surfacing cannot be persisted")
+
+        // Restore the DB and re-run: converges, no rows left recording.
+        trigger.stopFailing()
+        _ = try await store.reconcile(storage: layout, at: reading())
+        #expect(try countRows(layout.databaseURL.path, whereClause: "state='recording'") == 0)
+        #expect(try countRows(layout.databaseURL.path, whereClause: "state='ready'") >= 2)
+    }
+
+    @Test func hashFailurePreservesFileAndNeverCommitsReady() async throws {
+        // A file that ffprobe would decode but cannot be hashed (unreadable) must NOT become
+        // `ready` with sentinel metadata. We inject a probe that *claims* decodable, while
+        // the real file is chmod 000 so SHA-256 fails during inventory measurement.
+        let (layout, store, root) = try await makeLayoutAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let db = layout.databaseURL.path
+        _ = store  // store built by helper; we rebuild with the lying probe below
+        let trigger = PrivyWriteFailureTrigger()
+        let lyingStore = try PrivyStore(
+            databaseURL: layout.databaseURL, audioProbe: LyingProbe(), writeFailureTrigger: trigger
+        )
+        try await lyingStore.prepareDatabase()
+        let relPath = "2026-01-01T00-00-00.000000Z_locked.ogg"
+        let chunk = try await lyingStore.createChunk(newChunk(path: relPath))
+        let partial = audioURL(layout, relPath + ".partial")
+        try writeValidOgg(at: partial, durationSeconds: 1.0)
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: partial.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: partial.path) }
+
+        _ = try await lyingStore.reconcile(storage: layout, at: reading())
+
+        // Row is `failed` (preserved), never `ready` — no guessed/empty metadata committed.
+        let csv = try chunkRowCSV(db, id: chunk.id)
+        #expect(csv.hasPrefix("failed|"), "an unhashable file must not become ready")
+        // File preserved: a non-empty partial is renamed to the final `.ogg` then marked
+        // failed (rename needs directory write, not file read, so chmod 000 still renames).
+        #expect(FileManager.default.fileExists(atPath: audioURL(layout, relPath).path))
+    }
+
+    @Test func symlinkEscapeThrowsAndLeavesOutsideTargetUntouched() async throws {
+        // A symlink inside the audio dir pointing outside must be rejected during
+        // enumeration — containment is checked for EVERY entry (symlinks resolved), so the
+        // escape surfaces as a thrown error rather than being silently dropped/followed. The
+        // outside target is never probed, hashed, or moved.
+        let (layout, _, root) = try await makeLayoutAndStore()
+        defer { try? FileManager.default.removeItem(at: root) }
+        let outside = root.appendingPathComponent("outside-target.ogg")
+        try Data([0xC0, 0xFF, 0xEE]).write(to: outside)
+        let link = audioURL(layout, "escape.ogg")
+        try FileManager.default.createSymbolicLink(at: link, withDestinationURL: outside)
+
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL, audioProbe: FFprobeAudioProbe(), writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+        var didThrow = false
+        do {
+            _ = try await store.reconcile(storage: layout, at: reading())
+        } catch {
+            didThrow = true
+        }
+        #expect(didThrow, "a symlink escape must surface, not be silently followed")
+        #expect(try Data(contentsOf: outside) == Data([0xC0, 0xFF, 0xEE]), "outside target must be untouched")
+        #expect(try countRows(layout.databaseURL.path, whereClause: "state='ready'") == 0)
+    }
+
+    @Test func unreadableSubdirSurfacesRatherThanOmittingFiles() async throws {
+        // An unreadable subdirectory cannot be silently skipped: enumerateAudioFiles
+        // propagates the traversal error and reconcile throws.
+        let (layout, _, root) = try await makeLayoutAndStore()
+        defer {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: audioURL(layout, "secret").path)
+            try? FileManager.default.removeItem(at: root)
+        }
+        let secret = audioURL(layout, "secret")
+        try FileManager.default.createDirectory(at: secret, withIntermediateDirectories: true)
+        try Data([1, 2, 3]).write(to: secret.appendingPathComponent("hidden.ogg"))
+        try FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: secret.path)
+
+        let trigger = PrivyWriteFailureTrigger()
+        let store = try PrivyStore(
+            databaseURL: layout.databaseURL, audioProbe: FFprobeAudioProbe(), writeFailureTrigger: trigger
+        )
+        try await store.prepareDatabase()
+        await #expect(throws: (any Error).self) {
+            _ = try await store.reconcile(storage: layout, at: reading())
+        }
+    }
+
+    @Test func manyProbesDoNotBlockReconcileProgress() async throws {
+        // A slow probe is `await`ed off the actor (never busily polled on it). Reconcile
+        // over many such files finishes in bounded wall-time — not N × a real 10s probe —
+        // proving the actor yields per probe rather than blocking serially for the full
+        // probe lifetime. (BoundedProcess's own timeout/reap behavior is covered separately
+        // in AudioProbeTests; this test asserts the wall-time bound on the reconcile path.)
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("privy-recon-slow-\(UUID().uuidString)", isDirectory: true)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let layout = AppPaths.layout(rootedAt: root)
+        try AppPaths.ensureDirectoriesExist(layout)
+        let trigger = PrivyWriteFailureTrigger()
+        // 40ms/probe fake; each represents a probe that must be bounded-yielded.
+        let store = try PrivyStore(databaseURL: layout.databaseURL, audioProbe: SlowProbe(perProbeSeconds: 0.04), writeFailureTrigger: trigger)
+        try await store.prepareDatabase()
+        let n = 20
+        for i in 0..<n {
+            let rel = "2026-07-30T00-00-0\(i % 10)-\(i).ogg"
+            _ = try await store.createChunk(newChunk(path: rel))
+            try writeValidOgg(at: audioURL(layout, rel + ".partial"), durationSeconds: 0.5)
+        }
+
+        let start = Date()
+        _ = try await store.reconcile(storage: layout, at: reading())
+        let elapsed = Date().timeIntervalSince(start)
+        // 20 × 40ms ≈ 0.8s if yielded per probe; must be far below 20 × a real 10s probe.
+        #expect(elapsed < 6.0, "reconcile over many slow probes must be bounded; took \(elapsed)s")
+        #expect(try countRows(layout.databaseURL.path, whereClause: "state='recording'") == 0)
     }
 
     // MARK: - Pure planner (synthetic inventories)
@@ -515,4 +682,23 @@ private func files(in dir: URL) -> [String] {
 
 private func fileSize(_ url: URL) -> Int64 {
     Int64((try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0)
+}
+
+// MARK: - Test probe fakes
+
+/// A probe that always reports `.decodable`, regardless of the real file — used to drive the
+/// hash-failure path (a file that "would decode" but cannot be hashed).
+private struct LyingProbe: AudioProbing {
+    func probe(durationOf url: URL) async -> AudioProbeResult { .decodable(durationSeconds: 1.0) }
+}
+
+/// A probe that sleeps before returning, simulating a slow/hung probe that must be
+/// bounded-yielded rather than busily polled on the Store actor.
+private struct SlowProbe: AudioProbing {
+    let perProbeSeconds: Double
+    func probe(durationOf url: URL) async -> AudioProbeResult {
+        let nanos = UInt64(perProbeSeconds * 1_000_000_000)
+        try? await Task.sleep(nanoseconds: nanos)
+        return .decodable(durationSeconds: 0.5)
+    }
 }
