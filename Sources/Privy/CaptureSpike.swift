@@ -60,7 +60,10 @@ final class CaptureSpike {
             SpikeLog.log("engine error: no input device (sampleRate=0)")
             return
         }
-        input.installTap(onBus: 0, bufferSize: 4096, format: format) { [counter] buffer, _ in
+        // @Sendable is load-bearing: without it the closure inherits @MainActor
+        // isolation and the realtime audio thread trips the runtime's isolation
+        // assertion (SIGTRAP in dispatch_assert_queue_fail).
+        input.installTap(onBus: 0, bufferSize: 4096, format: format) { @Sendable [counter] buffer, _ in
             counter.add(Int(buffer.frameLength))
         }
         do {
