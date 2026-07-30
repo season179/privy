@@ -8,6 +8,17 @@ internal enum CaptureEngineError: Error, Equatable {
     case unsupportedInputFormat(String)
 }
 
+internal protocol CaptureEngineSleeping: Sendable {
+    func sleep(seconds: Double) async
+}
+
+internal struct ContinuousCaptureEngineSleeper: CaptureEngineSleeping {
+    func sleep(seconds: Double) async {
+        guard seconds > 0 else { return }
+        try? await Task.sleep(for: .seconds(seconds))
+    }
+}
+
 /// A narrow callback capture: configuration notifications receive only the event
 /// continuation, never CaptureEngine or the audio continuation. AsyncStream continuations
 /// are Sendable and `yield` is thread-safe; the stream is unbounded so events cannot be
@@ -92,6 +103,25 @@ internal struct CaptureOutput: Sendable {
         eventEmitter.emit(event)
     }
 
+    /// Finalizes converter state through the same path used by CaptureEngine.stop and
+    /// conversion-failure recovery. Returns whether downstream conversion may continue.
+    func finalizeConversion(
+        _ converter: AudioConverter16k,
+        afterTermination terminated: Bool
+    ) -> Bool {
+        if terminated {
+            if let block = converter.discardPendingPackage() {
+                emit(.queueOverrun(
+                    block.firstSampleTime,
+                    droppedSourceFrames: block.samples.count,
+                    durationSeconds: Double(block.samples.count) / Double(privySampleRate)
+                ))
+            }
+            return false
+        }
+        return yield(converter.finish())
+    }
+
     private func emitOverrun(_ overrun: ConvertedOverrun) {
         emit(.queueOverrun(
             overrun.at,
@@ -111,6 +141,8 @@ public actor CaptureEngine: AudioCapturing {
     private let engine: AVAudioEngine
     private let output: CaptureOutput
     private let forceInputUnavailable: Bool
+    private let restartDebounceSeconds: Double
+    private let restartSleeper: any CaptureEngineSleeping
 
     private var ring: RealtimeAudioRing?
     private var converter: AudioConverter16k?
@@ -121,8 +153,10 @@ public actor CaptureEngine: AudioCapturing {
     private var tapInstalled = false
     private var running = false
     private var starting = false
-    private var restarting = false
     private var conversionTerminated = false
+    private var restartDeadlineMonotonic: Double?
+    private var pendingRestartReason: RestartReason?
+    private var pendingRestartTask: Task<Void, Error>?
 
     public init(clock: any PrivyClock) {
         let output = CaptureOutput()
@@ -131,17 +165,27 @@ public actor CaptureEngine: AudioCapturing {
         self.output = output
         self.streams = output.streams
         self.forceInputUnavailable = false
+        self.restartDebounceSeconds = 0.5
+        self.restartSleeper = ContinuousCaptureEngineSleeper()
     }
 
-    /// Deterministic no-device seam; still drives the real CaptureEngine start/event
-    /// lifecycle without touching system audio hardware.
-    internal init(clock: any PrivyClock, forceInputUnavailable: Bool) {
+    /// Deterministic lifecycle seam; tests can force no input and manually advance the
+    /// restart debounce without touching system audio hardware or wall-clock sleeps.
+    internal init(
+        clock: any PrivyClock,
+        forceInputUnavailable: Bool,
+        restartDebounceSeconds: Double = 0.5,
+        restartSleeper: any CaptureEngineSleeping = ContinuousCaptureEngineSleeper()
+    ) {
+        precondition(restartDebounceSeconds > 0)
         let output = CaptureOutput()
         self.clock = clock
         self.engine = AVAudioEngine()
         self.output = output
         self.streams = output.streams
         self.forceInputUnavailable = forceInputUnavailable
+        self.restartDebounceSeconds = restartDebounceSeconds
+        self.restartSleeper = restartSleeper
     }
 
     public func start() async throws {
@@ -170,7 +214,10 @@ public actor CaptureEngine: AudioCapturing {
             throw CaptureEngineError.unsupportedInputFormat(detail)
         }
 
-        let maximumCallbackFrames = 4_096
+        let tapBufferHintFrames = 4_096
+        // AVAudioEngine treats the tap size as a hint and devices can deliver larger
+        // callbacks. Keep a generous hard ceiling so 8192-frame device quanta fit.
+        let maximumCallbackFrames = 16_384
         // Every allocation occurs before installTap. The callback sees only this fully
         // initialized fixed ring.
         let ring = RealtimeAudioRing(
@@ -204,7 +251,7 @@ public actor CaptureEngine: AudioCapturing {
         let tap = Self.makeTap(ring: ring)
         input.installTap(
             onBus: 0,
-            bufferSize: AVAudioFrameCount(maximumCallbackFrames),
+            bufferSize: AVAudioFrameCount(tapBufferHintFrames),
             format: nativeFormat,
             block: tap
         )
@@ -256,8 +303,9 @@ public actor CaptureEngine: AudioCapturing {
         while !conversionTerminated, ring?.count ?? 0 > 0 {
             _ = drainOne()
         }
-        if !conversionTerminated, let converter {
-            if !output.yield(converter.finish()) { conversionTerminated = true }
+        if let converter,
+           !output.finalizeConversion(converter, afterTermination: conversionTerminated) {
+            conversionTerminated = true
         }
         if let ring {
             emitDiscardedSourceFrames(ring.discardAll(), sampleRate: ring.sampleRate)
@@ -274,14 +322,47 @@ public actor CaptureEngine: AudioCapturing {
     }
 
     public func restart(reason: RestartReason) async throws {
-        guard !restarting else { return }
-        restarting = true
-        defer { restarting = false }
-        // Open one scheduler turn so a notification burst coalesces behind the flag.
-        await Task.yield()
+        let requestedDeadline = clock.now().monotonicSeconds + restartDebounceSeconds
+        restartDeadlineMonotonic = requestedDeadline
+        pendingRestartReason = coalescedRestartReason(pendingRestartReason, reason)
+
+        // A request arriving while one debounce/attempt is pending is fully absorbed.
+        // Only the first caller waits for, and receives errors from, the scheduled attempt.
+        guard pendingRestartTask == nil else { return }
+        let task = Task<Void, Error> { [weak self] in
+            guard let self else { return }
+            try await self.performDebouncedRestart()
+        }
+        pendingRestartTask = task
+        try await task.value
+    }
+
+    private func performDebouncedRestart() async throws {
+        defer {
+            pendingRestartTask = nil
+            restartDeadlineMonotonic = nil
+            pendingRestartReason = nil
+        }
+
+        while let deadline = restartDeadlineMonotonic {
+            let remaining = deadline - clock.now().monotonicSeconds
+            guard remaining > 0 else { break }
+            await restartSleeper.sleep(seconds: remaining)
+        }
+
+        let reason = pendingRestartReason ?? .manualRetry
         let stopReason: StopReason = reason == .deviceChange ? .deviceChange : .restart
         await stop(reason: stopReason)
         try await start()
+    }
+
+    private func coalescedRestartReason(
+        _ pending: RestartReason?,
+        _ incoming: RestartReason
+    ) -> RestartReason {
+        // Preserve device-change terminal semantics if any signal in the burst carries it.
+        if pending == .deviceChange || incoming == .deviceChange { return .deviceChange }
+        return incoming
     }
 
     private func drainLoop(epoch: UUID) async {
@@ -319,6 +400,9 @@ public actor CaptureEngine: AudioCapturing {
                 clock.now(),
                 detail: "16 kHz conversion failed: \(error)"
             ))
+            // Preserve exact accounting for valid samples packaged before this callback
+            // failed, then separately account the rejected source callback itself.
+            _ = output.finalizeConversion(converter, afterTermination: true)
             emitDiscardedSourceFrames(metadata.frameCount, sampleRate: ring.sampleRate)
             conversionTerminated = true
             return false

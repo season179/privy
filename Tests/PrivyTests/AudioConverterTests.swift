@@ -1,5 +1,6 @@
 import AVFoundation
 import Foundation
+import Synchronization
 import Testing
 @testable import PrivyCore
 
@@ -38,6 +39,63 @@ private actor CaptureEventCollector {
 
     func append(_ event: CaptureEvent) { events.append(event) }
     func snapshot() -> [CaptureEvent] { events }
+}
+
+private final class RestartTestClock: PrivyClock, Sendable {
+    private struct State {
+        var wall = Date(timeIntervalSince1970: 1_700_000_000)
+        var monotonic = 0.0
+    }
+
+    private let epoch = UUID()
+    private let state = Mutex(State())
+
+    func now() -> ClockReading {
+        state.withLock {
+            ClockReading(
+                wallUTC: $0.wall,
+                monotonicSeconds: $0.monotonic,
+                clockEpoch: epoch
+            )
+        }
+    }
+
+    func elapsedSeconds(from: ClockReading, to: ClockReading) -> Double {
+        guard from.clockEpoch == to.clockEpoch else { return 0 }
+        return to.monotonicSeconds - from.monotonicSeconds
+    }
+
+    func advance(seconds: Double) {
+        state.withLock {
+            $0.wall = $0.wall.addingTimeInterval(seconds)
+            $0.monotonic += seconds
+        }
+    }
+}
+
+private actor ManualCaptureEngineSleeper: CaptureEngineSleeping {
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func sleep(seconds: Double) async {
+        await withCheckedContinuation { continuation in
+            precondition(self.continuation == nil)
+            self.continuation = continuation
+        }
+    }
+
+    var isSleeping: Bool { continuation != nil }
+
+    func resume() {
+        let pending = continuation
+        continuation = nil
+        pending?.resume()
+    }
+}
+
+private actor RestartCallCounter {
+    private var count = 0
+    func completed() { count += 1 }
+    var completedCount: Int { count }
 }
 
 private func converterMetadata(
@@ -138,6 +196,46 @@ private func converterMetadata(
         #expect(largestPartitionDelta < 0.000_1)
     }
 
+    @Test func converts22050AcrossCallbackBoundariesWithoutLoss() throws {
+        let rate = 22_050.0
+        let format = converterFormat(rate: rate, channels: 1)
+        let partitioned = try AudioConverter16k(inputFormat: format)
+        var sourceStart: Int64 = 0
+        var blocks: [AudioBlock16k] = []
+        for (sequence, count) in [700, 700, 805].enumerated() {
+            let callbackStart = sourceStart
+            let input = converterBuffer(format: format, frames: count) { _, frame in
+                Float(sin(2 * Double.pi * 275 * Double(callbackStart + Int64(frame)) / rate))
+            }
+            blocks += try partitioned.process(
+                input,
+                metadata: converterMetadata(
+                    sequence: UInt64(sequence),
+                    sourceStart: sourceStart,
+                    rate: rate
+                )
+            )
+            sourceStart += Int64(count)
+        }
+        blocks += partitioned.finish()
+
+        let reference = try AudioConverter16k(inputFormat: format)
+        let oneShot = converterBuffer(format: format, frames: 2_205) { _, frame in
+            Float(sin(2 * Double.pi * 275 * Double(frame) / rate))
+        }
+        var referenceBlocks = try reference.process(
+            oneShot,
+            metadata: converterMetadata(sequence: 0, sourceStart: 0, rate: rate)
+        )
+        referenceBlocks += reference.finish()
+
+        let actual = blocks.flatMap(\.samples)
+        let expected = referenceBlocks.flatMap(\.samples)
+        #expect(actual.count == 1_600)
+        #expect(expected.count == actual.count)
+        #expect(zip(actual, expected).map { abs($0 - $1) }.max() ?? 0 < 0.000_1)
+    }
+
     @Test func sourceGapFlushesPartialAndResetsTimeline() throws {
         let format = converterFormat(rate: 48_000, channels: 1)
         let converter = try AudioConverter16k(inputFormat: format)
@@ -166,6 +264,43 @@ private func converterMetadata(
         #expect(tail[0].streamSampleStart == 1_600)
         let tailMean = tail[0].samples.reduce(0, +) / Float(tail[0].samples.count)
         #expect(tailMean < -0.2)
+    }
+
+    @Test func conversionFailureSurfacesPendingPackageAsExactOverrun() async throws {
+        let format = converterFormat(rate: 48_000, channels: 1)
+        let converter = try AudioConverter16k(inputFormat: format)
+        let valid = converterBuffer(format: format, frames: 2_400) { _, _ in 0.25 }
+        let invalid = converterBuffer(format: format, frames: 4_800) { _, _ in .nan }
+
+        #expect(try converter.process(
+            valid,
+            metadata: converterMetadata(sequence: 0, sourceStart: 0, rate: 48_000)
+        ).isEmpty)
+        do {
+            _ = try converter.process(
+                invalid,
+                metadata: converterMetadata(sequence: 1, sourceStart: 2_400, rate: 48_000)
+            )
+            Issue.record("non-finite conversion output must fail")
+        } catch {
+            // Expected: the prior valid 800-sample package remains claimable.
+        }
+
+        let output = CaptureOutput()
+        var events = output.streams.events.makeAsyncIterator()
+        #expect(!output.finalizeConversion(converter, afterTermination: true))
+
+        guard let event = await events.next() else {
+            Issue.record("pending conversion drop must emit telemetry")
+            return
+        }
+        guard case .queueOverrun(let at, let droppedFrames, let duration) = event else {
+            Issue.record("expected queueOverrun, got \(event)")
+            return
+        }
+        #expect(at.monotonicSeconds == 100)
+        #expect(droppedFrames == 800)
+        #expect(duration == 0.05)
     }
 
     @Test func formatChangeUsesFreshConverterAndCaptureEpoch() throws {
@@ -266,22 +401,45 @@ private func converterMetadata(
     }
 
     @Test func concurrentRestartBurstCoalescesToOneAttempt() async {
-        let engine = CaptureEngine(clock: SystemClock(), forceInputUnavailable: true)
+        let clock = RestartTestClock()
+        let sleeper = ManualCaptureEngineSleeper()
+        let engine = CaptureEngine(
+            clock: clock,
+            forceInputUnavailable: true,
+            restartSleeper: sleeper
+        )
         let collector = CaptureEventCollector()
+        let completedCalls = RestartCallCounter()
         let collectionTask = Task {
             for await event in engine.streams.events {
                 await collector.append(event)
             }
         }
 
-        await withTaskGroup(of: Void.self) { group in
-            for _ in 0..<25 {
-                group.addTask {
-                    try? await engine.restart(reason: .deviceChange)
+        let burstTask = Task {
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<25 {
+                    group.addTask {
+                        try? await engine.restart(reason: .deviceChange)
+                        await completedCalls.completed()
+                    }
                 }
             }
         }
-        try? await Task.sleep(for: .milliseconds(10))
+
+        // The first caller waits on the scheduled attempt; all other callers must be
+        // absorbed while fake monotonic time remains frozen inside the burst window.
+        while await completedCalls.completedCount < 24 { await Task.yield() }
+        #expect(await sleeper.isSleeping)
+        clock.advance(seconds: 0.5)
+        await sleeper.resume()
+        await burstTask.value
+
+        var collectorYields = 0
+        while await collector.snapshot().isEmpty, collectorYields < 100 {
+            collectorYields += 1
+            await Task.yield()
+        }
         collectionTask.cancel()
         await collectionTask.value
 
