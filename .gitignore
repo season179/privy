@@ -1,0 +1,28 @@
+# macOS
+.DS_Store
+
+# Xcode / Swift
+build/
+DerivedData/
+xcuserdata/
+*.xcuserstate
+.swiftpm/
+*.playground
+
+# Python sidecar (uv)
+.venv/
+__pycache__/
+
+# Secrets
+.env
+*.pem
+
+# Captured data — never commit audio or the index
+data/
+*.opus
+*.ogg
+*.caf
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.db
