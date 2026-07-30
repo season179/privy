@@ -86,6 +86,8 @@ actor VADService<Model: VADModelProcessing>: VADAnalyzing {
             return []
         }
         guard block.samples.allSatisfy(\.isFinite) else {
+            clearContinuity()
+            runtimeStatus = .failed("audio block contains a non-finite sample")
             throw VADServiceError.nonFiniteAudio
         }
         guard !block.samples.isEmpty else { return [] }

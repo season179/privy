@@ -44,6 +44,79 @@ actor SnapshotRecorder {
     func latest() -> PipelineSnapshot? { values.last }
 }
 
+actor SuspendingShadowWriter: ShadowChunkWriting {
+    private let record = ChunkRecord(
+        id: 999,
+        kind: .shadow,
+        startedAtUTC: Date(timeIntervalSince1970: 1_700_000_000),
+        startedMono: 0,
+        durationSeconds: 0,
+        relativeAudioPath: "suspended.ogg",
+        sizeBytes: 0,
+        checksumSHA256: nil,
+        state: .recording
+    )
+    private var appendStarted = false
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var active: ChunkRecord?
+    private(set) var closeReasons: [StopReason] = []
+
+    func append(_ block: AudioBlock16k) async throws -> [WriterTransition] {
+        appendStarted = true
+        while !released {
+            await withCheckedContinuation { waiters.append($0) }
+        }
+        active = record
+        return [.opened(record)]
+    }
+
+    func close(reason: StopReason, at: ClockReading) async throws -> [WriterTransition] {
+        closeReasons.append(reason)
+        active = nil
+        return []
+    }
+
+    func activeChunk() -> ChunkRecord? { active }
+    func hasStartedAppend() -> Bool { appendStarted }
+
+    func releaseAppend() {
+        released = true
+        let pending = waiters
+        waiters.removeAll()
+        pending.forEach { $0.resume() }
+    }
+}
+
+actor CloseReasonSpyWriter: ShadowChunkWriting {
+    private let record = ChunkRecord(
+        id: 777,
+        kind: .shadow,
+        startedAtUTC: Date(timeIntervalSince1970: 1_700_000_000),
+        startedMono: 0,
+        durationSeconds: 0,
+        relativeAudioPath: "spy.ogg",
+        sizeBytes: 0,
+        checksumSHA256: nil,
+        state: .recording
+    )
+    private var active = false
+    private(set) var closeReasons: [StopReason] = []
+
+    func append(_ block: AudioBlock16k) async throws -> [WriterTransition] {
+        active = true
+        return [.opened(record)]
+    }
+
+    func close(reason: StopReason, at: ClockReading) async throws -> [WriterTransition] {
+        closeReasons.append(reason)
+        active = false
+        return []
+    }
+
+    func activeChunk() -> ChunkRecord? { active ? record : nil }
+}
+
 private struct PipelineFixture {
     let pipeline: ShadowCapturePipeline
     let capture: PipelineFakeCapture
@@ -58,7 +131,8 @@ private struct PipelineFixture {
 private func makePipelineFixture(
     rotationSamples: Int = ShadowChunkWriter.rotationSamples,
     vadLaneCapacity: Int = 8,
-    model: DeterministicVADModel = DeterministicVADModel()
+    model: DeterministicVADModel = DeterministicVADModel(),
+    writerBuilder: ((RecordingFakeStore, StorageLayout) -> any ShadowChunkWriting)? = nil
 ) throws -> PipelineFixture {
     let root = FileManager.default.temporaryDirectory
         .appendingPathComponent("privy-pipeline-tests-\(UUID())", isDirectory: true)
@@ -70,7 +144,7 @@ private func makePipelineFixture(
         audioDirectory: audio
     )
     let store = RecordingFakeStore()
-    let writer = ShadowChunkWriter(
+    let writer: any ShadowChunkWriting = writerBuilder?(store, layout) ?? ShadowChunkWriter(
         store: store,
         storage: layout,
         rotationSamples: rotationSamples
@@ -160,6 +234,10 @@ private func cleanUp(_ fixture: PipelineFixture) async {
 
         let deadline = fixture.clock.now().wallUTC.addingTimeInterval(3_600)
         await fixture.pipeline.pause(untilUTC: deadline)
+        #expect(await waitUntil {
+            if case .paused(untilUTC: deadline) = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
         fixture.clock.advance(seconds: 3_600)
         await fixture.pipeline.tick()
         #expect(await waitUntil { await fixture.capture.restarts.contains(.manualRetry) })
@@ -171,6 +249,37 @@ private func cleanUp(_ fixture: PipelineFixture) async {
             $0.kind == .engineRestart && $0.detail.message.contains("heartbeat")
         }.isEmpty)
         #expect((await fixture.capture.restarts).filter { $0 == .heartbeatTimeout }.isEmpty)
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func pauseInterleavingWithWriterAppendCannotOverwritePausedSnapshot() async throws {
+        let writer = SuspendingShadowWriter()
+        let fixture = try makePipelineFixture(writerBuilder: { _, _ in writer })
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        let reading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: reading,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil { await writer.hasStartedAppend() })
+
+        let pauseTask = Task { await fixture.pipeline.pause(untilUTC: nil) }
+        #expect(await waitUntil {
+            if case .paused(untilUTC: nil) = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+        await writer.releaseAppend()
+        await pauseTask.value
+        try? await Task.sleep(for: .milliseconds(20))
+
+        if case .paused(untilUTC: nil) = await fixture.snapshots.latest()?.capture {} else {
+            Issue.record("stale append completion overwrote the intentional paused state")
+        }
+        #expect(await writer.activeChunk() == nil)
         await fixture.pipeline.shutdown()
     }
 
@@ -261,6 +370,97 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         #expect(health.filter { $0.kind == .gap }.count == 1)
         #expect(health.filter { $0.kind == .error }.count == 1)
         #expect((await fixture.capture.restarts).filter { $0 == .heartbeatTimeout }.count == 1)
+        #expect((await fixture.capture.stops).contains(.fatalError))
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func firstStaleHeartbeatCannotRemainRecoveringForever() async throws {
+        let fixture = try makePipelineFixture()
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        let staleReading = fixture.clock.now()
+        fixture.clock.advance(seconds: 10)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: staleReading,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil {
+            if case .recovering = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+        await fixture.pipeline.tick()
+        #expect(await waitUntil {
+            (await fixture.capture.restarts).contains(.heartbeatTimeout)
+        })
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func fatalEngineStopRunsWriterTerminalRecoveryAndStopsCapture() async throws {
+        let fixture = try makePipelineFixture()
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        let reading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: reading,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil { (await fixture.store.allChunks()).first?.state == .recording })
+
+        let fatalAt = fixture.clock.now()
+        await fixture.capture.emit(.engineStopped(fatalAt, reason: .fatalError))
+        #expect(await waitUntil {
+            guard let state = (await fixture.store.allChunks()).first?.state else { return false }
+            return state == .ready || state == .failed
+        })
+        #expect((await fixture.capture.stops).contains(.fatalError))
+        #expect((await fixture.store.allHealth()).contains {
+            $0.kind == .recovery || $0.kind == .writerError
+        })
+
+        let discardedAt = fixture.clock.now()
+        await fixture.capture.emit(pipelineBlock(
+            start: 1_600,
+            sequence: 1,
+            reading: discardedAt,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).contains {
+                $0.kind == .gap && $0.detail.message.contains("after terminal capture failure")
+            }
+        })
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func heartbeatFaultInvokesFatalWriterCloseWiring() async throws {
+        let writer = CloseReasonSpyWriter()
+        let fixture = try makePipelineFixture(writerBuilder: { _, _ in writer })
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        let reading = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: reading,
+            captureEpoch: UUID()
+        ))
+        #expect(await waitUntil {
+            if case .recording = await fixture.snapshots.latest()?.capture { return true }
+            return false
+        })
+        fixture.clock.advance(seconds: 2.1)
+        await fixture.pipeline.tick()
+        fixture.clock.advance(seconds: 3.0)
+        await fixture.pipeline.tick()
+        #expect((await writer.closeReasons).contains(.restart))
+        #expect((await writer.closeReasons).contains(.fatalError))
+        #expect((await fixture.capture.stops).contains(.fatalError))
         await fixture.pipeline.shutdown()
     }
 
@@ -268,8 +468,34 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         let fixture = try makePipelineFixture()
         defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
         await fixture.pipeline.start()
+        let epoch = UUID()
+        let first = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 0,
+            sequence: 0,
+            reading: first,
+            captureEpoch: epoch
+        ))
+        #expect(await waitUntil { (await fixture.store.allChunks()).first?.state == .recording })
+
         let at = fixture.clock.now()
         await fixture.capture.emit(.queueOverrun(at, droppedSourceFrames: 4_800, durationSeconds: 0.1))
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).contains { $0.kind == .queueOverrun }
+        })
+        let afterGap = fixture.clock.now()
+        fixture.clock.advance(seconds: 0.1)
+        await fixture.capture.emit(pipelineBlock(
+            start: 3_200,
+            sequence: 2,
+            reading: afterGap,
+            captureEpoch: epoch
+        ))
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).filter { $0.kind == .recordingStarted }.count >= 1
+        })
+
         await fixture.pipeline.handle(.deviceListChanged(at))
         await fixture.pipeline.handle(.defaultInputChanged(at, deviceUID: "airpods"))
         try await Task.sleep(for: .milliseconds(650))
@@ -279,6 +505,7 @@ private func cleanUp(_ fixture: PipelineFixture) async {
         #expect(health.filter { $0.kind == .gap }.count == 1)
         #expect(health.filter { $0.kind == .vadGap }.count == 1)
         #expect(health.filter { $0.kind == .deviceChange }.count == 1)
+        #expect(health.first { $0.kind == .engineRestart && $0.detail.message.contains("device") }?.detail.deviceUID == "airpods")
         #expect((await fixture.capture.restarts).filter { $0 == .deviceChange }.count == 1)
         await fixture.pipeline.shutdown()
     }
@@ -341,6 +568,44 @@ private func cleanUp(_ fixture: PipelineFixture) async {
             await fixture.pipeline.shutdown()
             return
         }
+        await fixture.pipeline.shutdown()
+    }
+
+    @Test func VADEventStoreFailureKeepsCaptureRecordingAndMarksOnlyVADFailed() async throws {
+        let fixture = try makePipelineFixture()
+        defer { fixture.snapshotTask.cancel(); try? FileManager.default.removeItem(at: fixture.root) }
+        await fixture.pipeline.start()
+        #expect(await waitUntil { await fixture.snapshots.latest()?.vad == .ready })
+        await fixture.store.setFailure(.vad)
+
+        let epoch = UUID()
+        for index in 0 ..< 4 {
+            let reading = fixture.clock.now()
+            fixture.clock.advance(seconds: 0.256)
+            await fixture.capture.emit(pipelineBlock(
+                count: 4_096,
+                start: Int64(index * 4_096),
+                sequence: UInt64(index),
+                reading: reading,
+                captureEpoch: epoch
+            ))
+        }
+
+        #expect(await waitUntil {
+            (await fixture.store.allHealth()).contains {
+                $0.kind == .vadError && $0.detail.message.contains("could not be persisted")
+            }
+        })
+        let latest = await fixture.snapshots.latest()
+        if case .recording = latest?.capture {} else {
+            Issue.record("VAD event persistence failure stopped capture")
+        }
+        guard case .failed = latest?.vad else {
+            Issue.record("VAD persistence failure was not visible in the snapshot")
+            return
+        }
+        #expect((await fixture.store.allChunks()).contains { $0.state == .recording })
+        #expect(!(await fixture.capture.stops).contains(.fatalError))
         await fixture.pipeline.shutdown()
     }
 

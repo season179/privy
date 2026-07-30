@@ -37,6 +37,10 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     private var pausedIntentionally = false
     private var pendingDeviceUID: String?
     private var deviceRestartGeneration: UInt64 = 0
+    private var lifecycleGeneration: UInt64 = 0
+    private var intentionalStopReason: StopReason?
+    private var terminalFailureInProgress = false
+    private var accountedOverrunAwaitingNextBlock = false
 
     private var lastCaptureEpoch: UUID?
     private var lastSequence: UInt64?
@@ -44,6 +48,10 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     private var vadGeneration: UInt64 = 0
     private var chunkSpans: [ChunkSpan] = []
     private var pendingVADEvents: [VADEventRecord] = []
+    private var vadPersistenceFailed = false
+    private var discardedErrorSamples: Int64 = 0
+    private var discardedErrorStartedAt: ClockReading?
+    private var discardedErrorEndedAt: ClockReading?
 
     private var audioTask: Task<Void, Never>?
     private var captureEventTask: Task<Void, Never>?
@@ -51,6 +59,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     private var vadPreparationTask: Task<Void, Never>?
     private var timerTask: Task<Void, Never>?
     private var deviceRestartTask: Task<Void, Never>?
+    private var discardedErrorTask: Task<Void, Never>?
 
     init(
         capture: any AudioCapturing,
@@ -84,6 +93,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     func start() async {
         guard case .stopped = captureReality else { return }
         shuttingDown = false
+        terminalFailureInProgress = false
+        intentionalStopReason = nil
         captureReality = .starting
         publishSnapshot()
 
@@ -144,12 +155,10 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             // The first successfully written audio block is still required before the
             // observed state can become `.recording`.
         } catch {
-            captureReality = .error("capture start failed: \(error)")
-            await persistHealth(
-                kind: .error,
-                severity: .error,
+            await enterTerminalCaptureError(
+                message: "capture start failed: \(error)",
                 at: clock.now(),
-                message: "capture start failed: \(error)"
+                recoverWriter: false
             )
         }
         publishSnapshot()
@@ -158,6 +167,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     func shutdown() async {
         guard !shuttingDown else { return }
         shuttingDown = true
+        lifecycleGeneration &+= 1
+        intentionalStopReason = .shutdown
         watchdog.disarm()
         pauseDeadlineUTC = nil
         deviceRestartTask?.cancel()
@@ -177,6 +188,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         audioTask?.cancel()
         captureEventTask?.cancel()
         vadPreparationTask?.cancel()
+        discardedErrorTask?.cancel()
+        await flushDiscardedErrorBlocks(at: now)
         vadContinuation.finish()
         await vadTask?.value
         await flushVADEvents()
@@ -185,7 +198,9 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     }
 
     func pause(untilUTC: Date?) async {
-        guard !shuttingDown else { return }
+        guard !shuttingDown, !terminalFailureInProgress else { return }
+        lifecycleGeneration &+= 1
+        intentionalStopReason = .manualPause
         watchdog.disarm()
         pauseDeadlineUTC = untilUTC
         pausedIntentionally = true
@@ -212,7 +227,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     }
 
     func resume() async {
-        guard !shuttingDown else { return }
+        guard !shuttingDown, !terminalFailureInProgress else { return }
         guard pausedIntentionally else { return }
         pauseDeadlineUTC = nil
         pausedIntentionally = false
@@ -234,6 +249,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     }
 
     private func willSleep(at: ClockReading) async {
+        lifecycleGeneration &+= 1
+        intentionalStopReason = .systemSleep
         watchdog.disarm()
         sleepStarted = at
         captureReality = .recovering("system sleep")
@@ -280,6 +297,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             return
         }
 
+        intentionalStopReason = nil
         captureReality = .recovering("waking audio capture")
         watchdog.beginWakeGrace(at: at)
         publishSnapshot()
@@ -292,13 +310,10 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                 message: "capture rebuilt after wake"
             )
         } catch {
-            captureReality = .error("wake restart failed: \(error)")
-            watchdog.disarm()
-            await persistHealth(
-                kind: .error,
-                severity: .error,
+            await enterTerminalCaptureError(
+                message: "wake restart failed: \(error)",
                 at: at,
-                message: "wake restart failed: \(error)"
+                recoverWriter: true
             )
         }
         publishSnapshot()
@@ -321,6 +336,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         let now = clock.now()
         let uid = pendingDeviceUID
         pendingDeviceUID = nil
+        lifecycleGeneration &+= 1
+        intentionalStopReason = .deviceChange
         watchdog.disarm()
         captureReality = .recovering("audio device changed")
         publishSnapshot()
@@ -339,11 +356,20 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         }
         currentChunk = nil
         resetCaptureContinuity()
-        await restartCapture(reason: .deviceChange, message: "capture rebuilt for device change")
+        await restartCapture(
+            reason: .deviceChange,
+            message: "capture rebuilt for device change",
+            deviceUID: uid
+        )
     }
 
-    private func restartCapture(reason: RestartReason, message: String) async {
+    private func restartCapture(
+        reason: RestartReason,
+        message: String,
+        deviceUID: String? = nil
+    ) async {
         let now = clock.now()
+        intentionalStopReason = nil
         watchdog.disarm()
         captureReality = .recovering(message)
         publishSnapshot()
@@ -354,16 +380,13 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                 severity: .info,
                 at: now,
                 message: message,
-                deviceUID: pendingDeviceUID
+                deviceUID: deviceUID
             )
         } catch {
-            engineRunning = false
-            captureReality = .error("capture restart failed: \(error)")
-            await persistHealth(
-                kind: .error,
-                severity: .error,
+            await enterTerminalCaptureError(
+                message: "capture restart failed: \(error)",
                 at: now,
-                message: "capture restart failed: \(error)"
+                recoverWriter: true
             )
         }
         publishSnapshot()
@@ -374,29 +397,54 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
     private func receive(_ block: AudioBlock16k) async {
         guard !shuttingDown else { return }
         switch captureReality {
-        case .paused, .stopped, .error:
+        case .paused, .stopped:
+            return
+        case .error:
+            recordDiscardedErrorBlock(block)
             return
         case .starting, .recording, .recovering:
             break
         }
 
+        let generation = lifecycleGeneration
         let discontinuity = continuityGap(before: block)
+        let suppressAccountedOverrun = accountedOverrunAwaitingNextBlock
+        accountedOverrunAwaitingNextBlock = false
         let transitions: [WriterTransition]
         do {
             // Lossless-priority lane: this always completes before the VAD copy is
             // offered to its bounded, best-effort lane.
             transitions = try await writer.append(block)
-            apply(transitions)
         } catch {
-            watchdog.disarm()
-            engineRunning = false
-            captureReality = .error("writer failed: \(error)")
-            await reportWriterError(error, at: clock.now())
-            publishSnapshot()
+            if generation != lifecycleGeneration || shuttingDown {
+                await reportWriterError(error, at: block.firstSampleTime)
+                await closeWriterAfterStaleAppend(at: block.firstSampleTime)
+                return
+            }
+            await enterTerminalCaptureError(
+                message: "writer failed: \(error)",
+                at: clock.now(),
+                recoverWriter: false,
+                writerFailure: error
+            )
             return
         }
 
-        if let discontinuity {
+        guard generation == lifecycleGeneration, !shuttingDown else {
+            apply(transitions)
+            await closeWriterAfterStaleAppend(at: block.firstSampleTime)
+            return
+        }
+        switch captureReality {
+        case .paused, .stopped, .error:
+            apply(transitions)
+            await closeWriterAfterStaleAppend(at: block.firstSampleTime)
+            return
+        case .starting, .recording, .recovering:
+            apply(transitions)
+        }
+
+        if let discontinuity, !suppressAccountedOverrun {
             vadGeneration &+= 1
             await persistHealth(
                 kind: .gap,
@@ -456,7 +504,9 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                 )
             }
         } else {
-            watchdog.disarm()
+            if !watchdog.isArmed, !watchdog.isInWakeGrace {
+                watchdog.arm(withFreshHeartbeat: heartbeat)
+            }
             captureReality = .recovering("audio heartbeat is stale")
         }
         publishSnapshot()
@@ -471,9 +521,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                 kind: .vadGap,
                 severity: .warning,
                 at: now,
-                message: "VAD lane full; dropped one \(block.samples.count)-sample block",
-                durationSeconds: Double(block.samples.count) / Double(privySampleRate),
-                droppedFrames: Int64(block.samples.count)
+                message: "VAD lane full; dropped one \(block.samples.count)-sample converted block",
+                durationSeconds: Double(block.samples.count) / Double(privySampleRate)
             )
         case .terminated:
             if !shuttingDown {
@@ -482,9 +531,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                     kind: .vadGap,
                     severity: .error,
                     at: now,
-                    message: "VAD lane terminated; dropped one block",
-                    durationSeconds: Double(block.samples.count) / Double(privySampleRate),
-                    droppedFrames: Int64(block.samples.count)
+                    message: "VAD lane terminated; dropped one converted block",
+                    durationSeconds: Double(block.samples.count) / Double(privySampleRate)
                 )
             }
         @unknown default:
@@ -505,24 +553,29 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             engineRunning = true
             if case .stopped = captureReality { captureReality = .starting }
 
-        case .engineStopped(_, let reason):
+        case .engineStopped(let at, let reason):
             engineRunning = false
             if reason == .fatalError {
-                watchdog.disarm()
-                captureReality = .error("capture engine stopped fatally")
+                await enterTerminalCaptureError(
+                    message: "capture engine stopped fatally",
+                    at: at,
+                    recoverWriter: true
+                )
             }
 
         case .configurationChanged:
             scheduleDeviceRestart(deviceUID: nil)
 
         case .inputUnavailable(let at, let detail):
-            watchdog.disarm()
-            engineRunning = false
-            captureReality = .error("input unavailable: \(detail)")
-            await persistHealth(kind: .error, severity: .error, at: at, message: "input unavailable: \(detail)")
+            await enterTerminalCaptureError(
+                message: "input unavailable: \(detail)",
+                at: at,
+                recoverWriter: true
+            )
 
         case .queueOverrun(let at, let droppedFrames, let duration):
             vadGeneration &+= 1
+            accountedOverrunAwaitingNextBlock = true
             captureReality = .recovering("capture queue overrun")
             await persistHealth(
                 kind: .queueOverrun,
@@ -587,6 +640,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         var consumedGeneration: UInt64?
         for await item in vadLane {
             guard !Task.isCancelled else { break }
+            guard !vadPersistenceFailed else { continue }
             if consumedGeneration != item.generation {
                 await vad.reset(afterGapAt: item.block.firstSampleTime)
                 consumedGeneration = item.generation
@@ -666,13 +720,12 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             try await store.appendVADEvents(events)
             pendingVADEvents.removeFirst(events.count)
         } catch {
-            captureReality = .error("VAD event persistence failed: \(error)")
-            appendLocalHealth(
-                kind: .error,
-                severity: .error,
-                at: clock.now(),
-                message: "VAD observations could not be persisted: \(error)"
-            )
+            pendingVADEvents.removeAll()
+            vadPersistenceFailed = true
+            let message = "VAD observations could not be persisted; recording continues: \(error)"
+            vadRuntimeStatus = .failed(message)
+            await vad.reset(afterGapAt: clock.now())
+            await persistVADHealthBestEffort(message: message, at: clock.now())
             publishSnapshot()
         }
     }
@@ -691,6 +744,12 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
 
     func tick() async {
         guard !shuttingDown else { return }
+        switch captureReality {
+        case .error, .stopped:
+            return
+        case .starting, .recording, .paused, .recovering:
+            break
+        }
         let now = clock.now()
         if let pauseDeadlineUTC, now.wallUTC >= pauseDeadlineUTC {
             if pausedIntentionally {
@@ -705,6 +764,8 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         for action in actions {
             switch action {
             case .restart(let heartbeat, let detectedAt):
+                lifecycleGeneration &+= 1
+                intentionalStopReason = .restart
                 watchdog.disarm()
                 pendingRecoveryGapStart = heartbeat
                 captureReality = .recovering("audio heartbeat timed out")
@@ -714,11 +775,16 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                     currentChunk = nil
                     resetCaptureContinuity()
                 } catch {
-                    captureReality = .error("writer failed during heartbeat restart")
                     pendingRecoveryGapStart = nil
-                    await reportWriterError(error, at: detectedAt)
+                    await enterTerminalCaptureError(
+                        message: "writer failed during heartbeat restart: \(error)",
+                        at: detectedAt,
+                        recoverWriter: false,
+                        writerFailure: error
+                    )
                     continue
                 }
+                intentionalStopReason = nil
                 do {
                     try await capture.restart(reason: .heartbeatTimeout)
                     await persistHealth(
@@ -742,48 +808,162 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
                 }
 
             case .heartbeatFault(let heartbeat, let detectedAt):
-                watchdog.disarm()
                 pendingRecoveryGapStart = nil
-                engineRunning = false
-                captureReality = .error("no audio heartbeat for 5 seconds")
-                await persistHealth(
-                    kind: .gap,
-                    severity: .error,
+                await enterTerminalCaptureError(
+                    message: "capture declared dead after 5-second heartbeat timeout",
                     at: detectedAt,
-                    message: "audio heartbeat absent after restart attempt",
+                    recoverWriter: true,
                     gapStarted: heartbeat,
-                    gapEnded: detectedAt,
-                    durationSeconds: max(0, clock.elapsedSeconds(from: heartbeat, to: detectedAt))
-                )
-                await persistHealth(
-                    kind: .error,
-                    severity: .error,
-                    at: detectedAt,
-                    message: "capture declared dead after 5-second heartbeat timeout"
+                    gapMessage: "audio heartbeat absent after restart attempt"
                 )
 
             case .wakeGraceExpired(let wake, let detectedAt):
-                watchdog.disarm()
-                engineRunning = false
-                captureReality = .error("no fresh audio within wake grace")
-                await persistHealth(
-                    kind: .gap,
-                    severity: .error,
+                await enterTerminalCaptureError(
+                    message: "10-second wake grace expired",
                     at: detectedAt,
-                    message: "wake recovery produced no fresh audio",
+                    recoverWriter: true,
                     gapStarted: wake,
-                    gapEnded: detectedAt,
-                    durationSeconds: max(0, clock.elapsedSeconds(from: wake, to: detectedAt))
-                )
-                await persistHealth(
-                    kind: .error,
-                    severity: .error,
-                    at: detectedAt,
-                    message: "10-second wake grace expired"
+                    gapMessage: "wake recovery produced no fresh audio"
                 )
             }
         }
         publishSnapshot()
+    }
+
+    // MARK: - Terminal failure and discarded audio
+
+    private func enterTerminalCaptureError(
+        message: String,
+        at: ClockReading,
+        recoverWriter: Bool,
+        writerFailure: Error? = nil,
+        gapStarted: ClockReading? = nil,
+        gapMessage: String? = nil
+    ) async {
+        guard !terminalFailureInProgress else { return }
+        terminalFailureInProgress = true
+        lifecycleGeneration &+= 1
+        intentionalStopReason = .fatalError
+        watchdog.disarm()
+        captureReality = .error(message)
+        publishSnapshot()
+
+        await capture.stop(reason: .fatalError)
+        engineRunning = false
+
+        if let writerFailure {
+            await reportWriterError(writerFailure, at: at)
+        }
+        if recoverWriter {
+            let hadActiveChunk = await writer.activeChunk() != nil
+            do {
+                apply(try await writer.close(reason: .fatalError, at: at))
+                if hadActiveChunk {
+                    await persistHealth(
+                        kind: .recovery,
+                        severity: .warning,
+                        at: at,
+                        message: "fatal writer recovery terminally resolved the active chunk"
+                    )
+                }
+            } catch {
+                await reportWriterError(error, at: at)
+            }
+        }
+        currentChunk = nil
+
+        if let gapStarted, let gapMessage {
+            await persistHealth(
+                kind: .gap,
+                severity: .error,
+                at: at,
+                message: gapMessage,
+                gapStarted: gapStarted,
+                gapEnded: at,
+                durationSeconds: max(0, clock.elapsedSeconds(from: gapStarted, to: at))
+            )
+        }
+        await persistHealth(kind: .error, severity: .error, at: at, message: message)
+        await flushDiscardedErrorBlocks(at: at)
+        publishSnapshot()
+    }
+
+    private func closeWriterAfterStaleAppend(at: ClockReading) async {
+        let reason = intentionalStopReason ?? .restart
+        let hadActiveChunk = await writer.activeChunk() != nil
+        do {
+            apply(try await writer.close(reason: reason, at: at))
+            if reason == .fatalError, hadActiveChunk {
+                await persistHealth(
+                    kind: .recovery,
+                    severity: .warning,
+                    at: at,
+                    message: "fatal writer recovery resolved a chunk opened by an interleaved append"
+                )
+            }
+        } catch {
+            await reportWriterError(error, at: at)
+        }
+        currentChunk = nil
+    }
+
+    private func recordDiscardedErrorBlock(_ block: AudioBlock16k) {
+        discardedErrorSamples += Int64(block.samples.count)
+        if discardedErrorStartedAt == nil {
+            discardedErrorStartedAt = block.firstSampleTime
+        }
+        discardedErrorEndedAt = readingAtEnd(of: block)
+        discardedErrorTask?.cancel()
+        discardedErrorTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            await self?.flushDiscardedErrorBlocks(at: nil)
+        }
+    }
+
+    private func flushDiscardedErrorBlocks(at reading: ClockReading?) async {
+        guard discardedErrorSamples > 0,
+              let started = discardedErrorStartedAt,
+              let ended = discardedErrorEndedAt else { return }
+        let samples = discardedErrorSamples
+        discardedErrorSamples = 0
+        discardedErrorStartedAt = nil
+        discardedErrorEndedAt = nil
+        discardedErrorTask?.cancel()
+        discardedErrorTask = nil
+        await persistHealth(
+            kind: .gap,
+            severity: .error,
+            at: reading ?? ended,
+            message: "discarded \(samples) converted samples after terminal capture failure",
+            gapStarted: started,
+            gapEnded: ended,
+            durationSeconds: Double(samples) / Double(privySampleRate)
+        )
+    }
+
+    private func persistVADHealthBestEffort(message: String, at: ClockReading) async {
+        let event = makeHealthEvent(
+            kind: .vadError,
+            severity: .error,
+            at: at,
+            message: message
+        )
+        do {
+            try await store.appendHealth(event)
+        } catch {
+            appendLocalHealth(
+                kind: .vadError,
+                severity: .error,
+                at: at,
+                message: "\(message); health persistence also failed: \(error)"
+            )
+            return
+        }
+        recentHealth.append(event)
+        if recentHealth.count > 20 {
+            recentHealth.removeFirst(recentHealth.count - 20)
+        }
     }
 
     // MARK: - Writer transitions and health
@@ -852,7 +1032,6 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
             return true
         } catch {
             recentHealth.append(event)
-            captureReality = .error("health persistence failed: \(error)")
             appendLocalHealth(
                 kind: .error,
                 severity: .error,
@@ -914,6 +1093,7 @@ actor ShadowCapturePipeline: ShadowCaptureControlling {
         lastCaptureEpoch = nil
         lastSequence = nil
         lastStreamEnd = nil
+        accountedOverrunAwaitingNextBlock = false
         vadGeneration &+= 1
     }
 

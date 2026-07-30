@@ -145,6 +145,30 @@ private func vadBlock(
         #expect(await model.stateResetCount() == 2)
     }
 
+    @Test func nonFiniteAudioFailsRuntimeOnceAndPreventsRepeatedErrorSpam() async throws {
+        let model = DeterministicVADModel()
+        let service = VADService(model: model)
+        await service.prepare()
+        var block = vadBlock(count: 4_096, start: 0, sequence: 0, mono: 0)
+        var samples = block.samples
+        samples[20] = .nan
+        block = AudioBlock16k(
+            captureEpoch: block.captureEpoch,
+            sequence: block.sequence,
+            streamSampleStart: block.streamSampleStart,
+            firstSampleTime: block.firstSampleTime,
+            samples: samples
+        )
+
+        await #expect(throws: (any Error).self) { try await service.process(block) }
+        guard case .failed = await service.status() else {
+            Issue.record("non-finite input left VAD snapshot status ready")
+            return
+        }
+        #expect(try await service.process(block).isEmpty)
+        #expect((await model.recordedCalls()).isEmpty)
+    }
+
     @Test func preparationAndRuntimeFailureAreVisibleButSubsequentBlocksDoNotThrow() async throws {
         let model = DeterministicVADModel()
         let service = VADService(model: model)
