@@ -126,33 +126,28 @@ public actor PrivyStore: PrivyStoring {
     ) async throws -> ChunkRecord {
         try requirePrepared()
         return try db.write { db -> ChunkRecord in
-            try db.execute(
+            let outcome = try classifyGuardedUpdate(
+                db,
                 sql: """
                     UPDATE chunks
                     SET duration_s = ?, size_bytes = ?, checksum = ?, state = ?
                     WHERE id = ? AND state = ?
                     """,
                 arguments: [durationSeconds, sizeBytes, checksumSHA256,
-                            ChunkState.ready.rawValue, id, ChunkState.recording.rawValue]
+                            ChunkState.ready.rawValue, id, ChunkState.recording.rawValue],
+                chunkID: id,
+                intendedTerminal: .ready
             )
-            if db.changesCount == 1,
-               let updated = try ChunkRow.fetchOne(db, key: id) {
-                return try updated.toRecord()
-            }
-            // Zero rows: idempotent only if already ready; otherwise a real conflict.
-            let actual = try String.fetchOne(
-                db, sql: "SELECT state FROM chunks WHERE id = ?", arguments: [id]
-            )
-            switch actual {
-            case nil:
-                throw PrivyStoreError.unknownChunk(id: id)
-            case ChunkState.ready.rawValue:
-                guard let ready = try ChunkRow.fetchOne(db, key: id) else {
-                    throw PrivyStoreError.inconsistentRow("chunk \(id) vanished after idempotent finalize")
+            switch outcome {
+            case .applied, .alreadyTerminal:
+                guard let row = try ChunkRow.fetchOne(db, key: id) else {
+                    throw PrivyStoreError.inconsistentRow("chunk \(id) vanished after finalize")
                 }
-                return try ready.toRecord()
-            case let other:
-                throw PrivyStoreError.stateConflict(id: id, expected: ChunkState.recording.rawValue, actual: other ?? "<unknown>")
+                return try row.toRecord()
+            case .conflict(let actual):
+                throw PrivyStoreError.stateConflict(id: id, expected: ChunkState.recording.rawValue, actual: actual)
+            case .missing:
+                throw PrivyStoreError.unknownChunk(id: id)
             }
         }
     }
@@ -160,29 +155,27 @@ public actor PrivyStore: PrivyStoring {
     public func failChunk(id: Int64, reason: String) async throws {
         try requirePrepared()
         try db.write { db in
-            try db.execute(
+            let outcome = try classifyGuardedUpdate(
+                db,
                 sql: "UPDATE chunks SET state = ? WHERE id = ? AND state = ?",
-                arguments: [ChunkState.failed.rawValue, id, ChunkState.recording.rawValue]
+                arguments: [ChunkState.failed.rawValue, id, ChunkState.recording.rawValue],
+                chunkID: id,
+                intendedTerminal: .failed
             )
-            if db.changesCount == 1 {
+            switch outcome {
+            case .applied:
                 try insertHealth(db, event: HealthEvent(
                     atUTC: Date(),
                     kind: .writerError,
                     severity: .error,
                     detail: healthDetail(message: "chunk \(id) failed: \(reason)")
                 ))
-                return
-            }
-            let actual = try String.fetchOne(
-                db, sql: "SELECT state FROM chunks WHERE id = ?", arguments: [id]
-            )
-            switch actual {
-            case nil:
-                throw PrivyStoreError.unknownChunk(id: id)
-            case ChunkState.failed.rawValue:
+            case .alreadyTerminal:
                 return // already failed — idempotent
-            case let other:
-                throw PrivyStoreError.stateConflict(id: id, expected: ChunkState.recording.rawValue, actual: other ?? "<unknown>")
+            case .conflict(let actual):
+                throw PrivyStoreError.stateConflict(id: id, expected: ChunkState.recording.rawValue, actual: actual)
+            case .missing:
+                throw PrivyStoreError.unknownChunk(id: id)
             }
         }
     }
@@ -289,30 +282,45 @@ public actor PrivyStore: PrivyStoring {
     }
 
     /// Durably surfaces a per-action failure: terminalizes the affected row to `failed`
-    /// (preserving its file) and persists an `.error` health row, in one transaction. Throws
-    /// if the database is unavailable so the caller can record an unsurfaced failure.
+    /// (preserving its file) and persists an `.error` health row, in one transaction. The
+    /// terminalization is classified by `changesCount` (never ignored): a zero-row result
+    /// can only occur when the row is no longer `recording`/`ready` (those are the states the
+    /// WHERE matches), so no abandoned `recording` row can result, and the outcome is
+    /// recorded in the health message. Throws only when the write itself fails (database
+    /// unavailable) so the caller can record an unsurfaced failure and throw an aggregate.
     private func surfaceReconciliationFailure(
         action: ReconciliationAction,
         error: Error,
         at: ClockReading
     ) throws {
         try db.write { db in
+            let terminalNote: String
             if let chunkID = action.chunkID {
-                try db.execute(
+                let outcome = try classifyGuardedUpdate(
+                    db,
                     sql: "UPDATE chunks SET state = ? WHERE id = ? AND state IN (?, ?)",
                     arguments: [ChunkState.failed.rawValue, chunkID,
-                                ChunkState.recording.rawValue, ChunkState.ready.rawValue]
+                                ChunkState.recording.rawValue, ChunkState.ready.rawValue],
+                    chunkID: chunkID,
+                    intendedTerminal: .failed
                 )
-                // changesCount is intentionally not asserted here: this is best-effort
-                // terminalization; a row already terminal (failed/other) is left as-is and
-                // the health row still records what happened.
+                switch outcome {
+                case .applied: terminalNote = "row terminalized to failed"
+                case .alreadyTerminal: terminalNote = "row already failed"
+                // `recording`/`ready` cannot reach here (they match the WHERE), so these are
+                // already-terminal-ish states, not abandoned recording rows.
+                case .conflict(let actual): terminalNote = "row left in state \(actual)"
+                case .missing: terminalNote = "row no longer present"
+                }
+            } else {
+                terminalNote = "no owning chunk row"
             }
             try insertHealth(db, event: HealthEvent(
                 atUTC: at.wallUTC,
                 kind: .error,
                 severity: .error,
                 detail: healthDetail(
-                    message: "reconciliation action failed (\(action.kind.rawValue) \(action.relativeAudioPath)): \(error)"
+                    message: "reconciliation action failed (\(action.kind.rawValue) \(action.relativeAudioPath)): \(error) — \(terminalNote)"
                 )
             ))
         }
@@ -356,33 +364,49 @@ public actor PrivyStore: PrivyStoring {
         }
 
         let audioFiles = try enumerateAudioFiles(in: storage.audioDirectory)
-        var files: [ReconciliationFile] = []
-        files.reserveCapacity(audioFiles.count)
+        // First pass (synchronous): resolve the canonical relative path and filesystem size
+        // for every enumerated file. Symlink containment is re-checked per entry inside
+        // `relativePath`/`fileSize`, so a file that resolves outside the audio root throws
+        // here rather than being silently probed/hashed/moved.
+        var pending: [PendingAudioFile] = []
+        pending.reserveCapacity(audioFiles.count)
         for fileURL in audioFiles {
             let relativePath = try self.relativePath(of: fileURL, in: storage.audioDirectory)
             let size = try fileSize(at: fileURL)
-            let shouldProbe = probePaths.contains(relativePath)
+            pending.append(PendingAudioFile(url: fileURL, relativePath: relativePath, sizeBytes: size))
+        }
+        // Probe candidate files with bounded concurrency so many slow/hung probes do not
+        // serialize into N × timeout of startup time (finding 2). The Store actor yields
+        // throughout via the async `AudioProbing` seam.
+        let toProbe = pending.filter { probePaths.contains($0.relativePath) }
+        let probeResults = await probeAudioFilesBounded(toProbe, using: audioProbe)
+        // Second pass (synchronous): assemble the inventory in enumeration order. Hashing
+        // remains synchronous; it is local file I/O (no subprocess) and is fast relative to
+        // an ffprobe spawn. A hash failure turns a "decodable" probe into a failed
+        // measurement so the planner preserves the file rather than finalizing it short.
+        var files: [ReconciliationFile] = []
+        files.reserveCapacity(pending.count)
+        for file in pending {
+            let shouldProbe = probePaths.contains(file.relativePath)
             var probe: AudioProbeResult
             var checksum: String? = nil
             if shouldProbe {
-                probe = await audioProbe.probe(durationOf: fileURL)
+                probe = probeResults[file.url] ?? .failed(reason: "probe result missing")
                 if case .decodable = probe {
-                    // A hash failure turns a "decodable" probe into a failed measurement so
-                    // the planner preserves the file rather than finalizing it with a nil hash.
                     do {
-                        checksum = try sha256(of: fileURL)
+                        checksum = try sha256(of: file.url)
                     } catch {
                         probe = .failed(reason: "checksum measurement failed: \(error)")
                     }
                 }
             } else {
-                probe = (size == 0)
+                probe = (file.sizeBytes == 0)
                     ? .failed(reason: "empty file")
                     : .failed(reason: "not probed (orphan or terminal row)")
             }
             files.append(ReconciliationFile(
-                relativePath: relativePath,
-                sizeBytes: size,
+                relativePath: file.relativePath,
+                sizeBytes: file.sizeBytes,
                 probe: probe,
                 checksumSHA256: checksum
             ))
@@ -471,7 +495,8 @@ public actor PrivyStore: PrivyStoring {
             return
         }
         try db.write { db in
-            try db.execute(
+            let outcome = try classifyGuardedUpdate(
+                db,
                 sql: """
                     UPDATE chunks
                     SET duration_s = ?, size_bytes = ?, checksum = ?, state = ?
@@ -482,24 +507,30 @@ public actor PrivyStore: PrivyStoring {
                     ChunkState.ready.rawValue,
                     chunkID,
                     ChunkState.recording.rawValue, ChunkState.ready.rawValue,
-                ]
+                ],
+                chunkID: chunkID,
+                intendedTerminal: .ready
             )
-            let note: String
-            let severity: HealthSeverity
-            if db.changesCount == 1 {
-                note = "reconciled chunk \(chunkID) to ready: \(action.detail)"
-                severity = .info
-            } else {
-                let actual = try String.fetchOne(
-                    db, sql: "SELECT state FROM chunks WHERE id = ?", arguments: [chunkID]
-                ) ?? "<missing>"
-                note = "finalize skipped for chunk \(chunkID); row now in state \(actual)"
-                severity = .warning
+            switch outcome {
+            case .applied:
+                try insertHealth(db, event: HealthEvent(
+                    atUTC: at.wallUTC, kind: .recovery, severity: .info,
+                    detail: healthDetail(message: "reconciled chunk \(chunkID) to ready: \(action.detail)")
+                ))
+            case .alreadyTerminal:
+                try insertHealth(db, event: HealthEvent(
+                    atUTC: at.wallUTC, kind: .recovery, severity: .info,
+                    detail: healthDetail(message: "finalize idempotent for chunk \(chunkID); already ready: \(action.detail)")
+                ))
+            case .conflict(let actual):
+                // A missing/changed row is never a silent success: throw so the reconcile
+                // loop durably surfaces it (terminalize + health) rather than logging ready.
+                throw PrivyStoreError.stateConflict(
+                    id: chunkID, expected: "recording or ready", actual: actual
+                )
+            case .missing:
+                throw PrivyStoreError.unknownChunk(id: chunkID)
             }
-            try insertHealth(db, event: HealthEvent(
-                atUTC: at.wallUTC, kind: .recovery, severity: severity,
-                detail: healthDetail(message: note)
-            ))
         }
     }
 
@@ -597,8 +628,10 @@ public actor PrivyStore: PrivyStoring {
     }
 
     /// Guarded transition to `failed` plus a health row, in one transaction. The update is
-    /// changes-count-checked; a zero-row result (row already terminal) still logs the health
-    /// row so the event is never lost.
+    /// changes-count-classified: one row or an already-`failed` row commits the health row
+    /// and returns; a missing row or an unexpected (non-recording/ready) state still commits
+    /// the health row (so the event is never lost) and then throws so the caller can surface
+    /// the conflict — it is never silently treated as success.
     private func markFailedAndLog(
         chunkID: Int64,
         kind: HealthKind,
@@ -606,16 +639,30 @@ public actor PrivyStore: PrivyStoring {
         at: ClockReading,
         message: String
     ) throws {
-        try db.write { db in
-            try db.execute(
+        let outcome = try db.write { db -> GuardedOutcome in
+            let outcome = try classifyGuardedUpdate(
+                db,
                 sql: "UPDATE chunks SET state = ? WHERE id = ? AND state IN (?, ?)",
                 arguments: [ChunkState.failed.rawValue, chunkID,
-                            ChunkState.recording.rawValue, ChunkState.ready.rawValue]
+                            ChunkState.recording.rawValue, ChunkState.ready.rawValue],
+                chunkID: chunkID,
+                intendedTerminal: .failed
             )
             try insertHealth(db, event: HealthEvent(
                 atUTC: at.wallUTC, kind: kind, severity: severity,
                 detail: healthDetail(message: message)
             ))
+            return outcome
+        }
+        switch outcome {
+        case .applied, .alreadyTerminal:
+            return
+        case .conflict(let actual):
+            throw PrivyStoreError.stateConflict(
+                id: chunkID, expected: "recording or ready", actual: actual
+            )
+        case .missing:
+            throw PrivyStoreError.unknownChunk(id: chunkID)
         }
     }
 
@@ -863,6 +910,85 @@ final class GatedDBAccess: PrivyDBAccess {
 private let PartialSuffix = ".partial"
 private let DotOggSuffix = ".ogg"
 private let PartialDotOggSuffix = ".ogg.partial"
+
+// MARK: - Guarded-update classification
+
+/// A measured-but-not-yet-probed audio file gathered during inventory's first pass.
+private struct PendingAudioFile: Sendable {
+    let url: URL
+    let relativePath: String
+    let sizeBytes: Int64
+}
+
+/// Outcome of a guarded `WHERE state = ...` / `WHERE state IN (...)` UPDATE on a chunk row.
+/// One changed row is a real transition; zero rows is an idempotent success ONLY when the
+/// row is already in the operation's intended terminal state. Anything else is a conflict
+/// or a vanished row and must be surfaced, never silently treated as success (W2 constraint b).
+private enum GuardedOutcome: Sendable {
+    /// Exactly one row transitioned.
+    case applied
+    /// Zero rows changed; the row is already in the intended terminal state (idempotent).
+    case alreadyTerminal
+    /// Zero rows changed; the row is in an unexpected state.
+    case conflict(actualState: String)
+    /// Zero rows changed; no row matches the id.
+    case missing
+}
+
+/// Executes a guarded UPDATE and classifies the result by `db.changesCount`: one changed
+/// row is `.applied`; zero rows is fetched and classified against `intendedTerminal`.
+/// Centralizing this makes every guarded transition apply the same zero-row ruling, so a
+/// concurrent/external transition that zeroes the update can never be logged as success.
+/// Pure w.r.t. the database; touches only `db`.
+private func classifyGuardedUpdate(
+    _ db: Database,
+    sql: String,
+    arguments: StatementArguments,
+    chunkID: Int64,
+    intendedTerminal: ChunkState
+) throws -> GuardedOutcome {
+    try db.execute(sql: sql, arguments: arguments)
+    if db.changesCount == 1 { return .applied }
+    let actual = try String.fetchOne(
+        db, sql: "SELECT state FROM chunks WHERE id = ?", arguments: [chunkID]
+    )
+    switch actual {
+    case nil:
+        return .missing
+    case intendedTerminal.rawValue:
+        return .alreadyTerminal
+    case let other?:
+        return .conflict(actualState: other)
+    }
+}
+
+/// Probes the given files with a bounded number of in-flight probes (default 4) so startup
+/// cost is `ceil(N/batch) × maxProbeTime`, not `N × maxProbeTime` (finding 2). The Store
+/// actor is yielded throughout via the async `AudioProbing` seam. Results are keyed by URL.
+private func probeAudioFilesBounded(
+    _ files: [PendingAudioFile],
+    using probe: any AudioProbing,
+    batchSize: Int = 4
+) async -> [URL: AudioProbeResult] {
+    guard !files.isEmpty else { return [:] }
+    var results: [URL: AudioProbeResult] = [:]
+    results.reserveCapacity(files.count)
+    var start = files.startIndex
+    while start < files.endIndex {
+        let end = Swift.min(start + batchSize, files.endIndex)
+        await withTaskGroup(of: (URL, AudioProbeResult).self) { group in
+            for file in files[start..<end] {
+                let p = probe
+                group.addTask { (file.url, await p.probe(durationOf: file.url)) }
+            }
+            for await (url, result) in group {
+                results[url] = result
+            }
+        }
+        start = end
+    }
+    return results
+}
 
 private extension ReconciliationAction {
     /// The on-disk file for an orphan is named by `relativeAudioPath` directly (its
