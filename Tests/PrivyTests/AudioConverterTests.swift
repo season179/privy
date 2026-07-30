@@ -430,6 +430,14 @@ private func converterMetadata(
         // The first caller waits on the scheduled attempt; all other callers must be
         // absorbed while fake monotonic time remains frozen inside the burst window.
         while await completedCalls.completedCount < 24 { await Task.yield() }
+        // The scheduled attempt reaches the sleeper asynchronously after the absorbed
+        // callers return; spin until it does before asserting.
+        var sleeperYields = 0
+        while sleeperYields < 10_000 {
+            if await sleeper.isSleeping { break }
+            sleeperYields += 1
+            await Task.yield()
+        }
         #expect(await sleeper.isSleeping)
         clock.advance(seconds: 0.5)
         await sleeper.resume()
