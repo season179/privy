@@ -10,12 +10,6 @@ public struct StorageLayout: Sendable, Equatable {
     public let rootDirectory: URL
     public let databaseURL: URL
     public let audioDirectory: URL
-
-    public init(rootDirectory: URL, databaseURL: URL, audioDirectory: URL) {
-        self.rootDirectory = rootDirectory
-        self.databaseURL = databaseURL
-        self.audioDirectory = audioDirectory
-    }
 }
 
 /// The kind of reconciliation action planned for a recovered row/file pair. W2's
@@ -29,13 +23,6 @@ public struct ReconciliationAction: Sendable, Equatable {
     public let chunkID: Int64?
     public let relativeAudioPath: String
     public let detail: String
-
-    public init(kind: ReconciliationActionKind, chunkID: Int64?, relativeAudioPath: String, detail: String) {
-        self.kind = kind
-        self.chunkID = chunkID
-        self.relativeAudioPath = relativeAudioPath
-        self.detail = detail
-    }
 }
 
 public struct ReconciliationReport: Sendable, Equatable {
@@ -43,13 +30,6 @@ public struct ReconciliationReport: Sendable, Equatable {
     public let readyCount: Int
     public let failedCount: Int
     public let preservedFileCount: Int
-
-    public init(actions: [ReconciliationAction], readyCount: Int, failedCount: Int, preservedFileCount: Int) {
-        self.actions = actions
-        self.readyCount = readyCount
-        self.failedCount = failedCount
-        self.preservedFileCount = preservedFileCount
-    }
 }
 
 /// Chunk lifecycle states. M1 only writes `recording`, `ready`, and `failed`; later
@@ -68,13 +48,6 @@ public struct NewChunk: Sendable {
     public let startedAtUTC: Date
     public let startedMono: Double
     public let relativeAudioPath: String
-
-    public init(kind: ChunkKind, startedAtUTC: Date, startedMono: Double, relativeAudioPath: String) {
-        self.kind = kind
-        self.startedAtUTC = startedAtUTC
-        self.startedMono = startedMono
-        self.relativeAudioPath = relativeAudioPath
-    }
 }
 
 public struct ChunkRecord: Sendable, Equatable {
@@ -87,28 +60,6 @@ public struct ChunkRecord: Sendable, Equatable {
     public let sizeBytes: Int64
     public let checksumSHA256: String?
     public let state: ChunkState
-
-    public init(
-        id: Int64,
-        kind: ChunkKind,
-        startedAtUTC: Date,
-        startedMono: Double,
-        durationSeconds: Double,
-        relativeAudioPath: String,
-        sizeBytes: Int64,
-        checksumSHA256: String?,
-        state: ChunkState
-    ) {
-        self.id = id
-        self.kind = kind
-        self.startedAtUTC = startedAtUTC
-        self.startedMono = startedMono
-        self.durationSeconds = durationSeconds
-        self.relativeAudioPath = relativeAudioPath
-        self.sizeBytes = sizeBytes
-        self.checksumSHA256 = checksumSHA256
-        self.state = state
-    }
 }
 
 public struct VADEventRecord: Sendable, Equatable {
@@ -117,25 +68,12 @@ public struct VADEventRecord: Sendable, Equatable {
     public let kind: VADEventKind
     /// Required for `score`; optional on `speechStart`/`speechEnd` boundaries.
     public let score: Float?
-
-    public init(chunkID: Int64, monotonicSeconds: Double, kind: VADEventKind, score: Float?) {
-        self.chunkID = chunkID
-        self.monotonicSeconds = monotonicSeconds
-        self.kind = kind
-        self.score = score
-    }
 }
 
 public struct MenuSummary: Sendable, Equatable {
     public let currentChunk: ChunkRecord?
     public let bytesRecordedToday: Int64
     public let recentHealth: [HealthEvent]
-
-    public init(currentChunk: ChunkRecord?, bytesRecordedToday: Int64, recentHealth: [HealthEvent]) {
-        self.currentChunk = currentChunk
-        self.bytesRecordedToday = bytesRecordedToday
-        self.recentHealth = recentHealth
-    }
 }
 
 /// The SQLite-backed store. `PrivyStore` (W2) is an actor wrapping a GRDB

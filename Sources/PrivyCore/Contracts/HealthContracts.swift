@@ -50,28 +50,6 @@ public struct HealthDetail: Sendable, Codable, Equatable {
     /// `true` when `durationSeconds` was estimated from UTC (cross-process recovery)
     /// rather than measured from monotonic time within one epoch.
     public let durationIsEstimated: Bool
-
-    public init(
-        message: String,
-        clockEpoch: UUID? = nil,
-        monotonicSeconds: Double? = nil,
-        gapStartedUTC: Date? = nil,
-        gapEndedUTC: Date? = nil,
-        durationSeconds: Double? = nil,
-        deviceUID: String? = nil,
-        droppedFrames: Int64? = nil,
-        durationIsEstimated: Bool = false
-    ) {
-        self.message = message
-        self.clockEpoch = clockEpoch
-        self.monotonicSeconds = monotonicSeconds
-        self.gapStartedUTC = gapStartedUTC
-        self.gapEndedUTC = gapEndedUTC
-        self.durationSeconds = durationSeconds
-        self.deviceUID = deviceUID
-        self.droppedFrames = droppedFrames
-        self.durationIsEstimated = durationIsEstimated
-    }
 }
 
 /// The exact JSON object persisted in the `health.detail` column:
@@ -81,11 +59,6 @@ public struct HealthDetail: Sendable, Codable, Equatable {
 public struct HealthEnvelope: Sendable, Codable, Equatable {
     public let severity: HealthSeverity
     public let detail: HealthDetail
-
-    public init(severity: HealthSeverity, detail: HealthDetail) {
-        self.severity = severity
-        self.detail = detail
-    }
 }
 
 /// An in-memory health event. The `kind`/`atUTC` columns plus the `detail` JSON envelope
@@ -95,11 +68,4 @@ public struct HealthEvent: Sendable, Equatable {
     public let kind: HealthKind
     public let severity: HealthSeverity
     public let detail: HealthDetail
-
-    public init(atUTC: Date, kind: HealthKind, severity: HealthSeverity, detail: HealthDetail) {
-        self.atUTC = atUTC
-        self.kind = kind
-        self.severity = severity
-        self.detail = detail
-    }
 }
