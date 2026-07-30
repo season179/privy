@@ -70,7 +70,7 @@ run_audit() {
     [[ -d "$AUDIO" ]] || { print -u2 -- "error: audio directory not found: $AUDIO"; return 2; }
 
     if [[ -n "$SINCE_HOURS" ]]; then
-        [[ -z "$SINCE" && "$SINCE_HOURS" == <->(|.<->) ]] || {
+        [[ -z "$SINCE" && "$SINCE_HOURS" == <->(|.<->) ]] && (( SINCE_HOURS > 0 )) || {
             print -u2 -- "error: --since-hours must be a positive number and cannot accompany --since"
             return 2
         }
@@ -165,6 +165,9 @@ run_audit() {
 
         if (( count == 0 )); then
             fail "orphan-$kind: file=$file expected_audio_path=$row_path"
+            selected=1
+        elif (( count > 1 )); then
+            fail "duplicate-audio-row: file=$file audio_path=$row_path row_count=$count"
             selected=1
         fi
         if (( selected == 0 )); then
@@ -300,6 +303,10 @@ SQL
     make_fixture stuck-recording
     "$SQLITE" "$case_db" "UPDATE chunks SET state='recording' WHERE id=1;"
     expect_failure stuck-recording 'FAIL stuck-recording:'
+
+    make_fixture duplicate-audio-row
+    "$SQLITE" "$case_db" "INSERT INTO chunks(id,kind,started_at_utc,started_mono,duration_s,audio_path,size_bytes,state) VALUES(3,'shadow','2026-07-30T00:00:20.000000Z',20,1,'first.ogg',100,'failed');"
+    expect_failure duplicate-audio-row 'FAIL duplicate-audio-row:'
 
     make_fixture orphan-partial
     cp "$case_audio/first.ogg" "$case_audio/orphan.ogg.partial"
